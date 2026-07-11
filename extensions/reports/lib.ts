@@ -2,10 +2,10 @@
  * Shared report logic for the @kneel/babybuddy extension.
  *
  * Pure compute functions (one per report) that turn a `sync` snapshot into
- * markdown + JSON, plus a `makeReport` factory that wires a compute function
- * into a swamp report definition. Not a report entrypoint itself — it exports
- * no `report`, so the loader skips it and each report file re-exports through
- * `makeReport`.
+ * markdown + JSON, plus a `runReport` helper that loads the snapshot and hands
+ * it to a compute function. Not a report entrypoint itself — it exports no
+ * `report`, so the loader skips it and each report file delegates to
+ * `runReport`.
  *
  * @module
  */
@@ -560,4 +560,82 @@ export function tummyTime(e: EntriesSnapshot): ReportResult {
     )
   }`;
   return { markdown: md, json: { title, days, rows } };
+}
+
+/** Per-medication dose counts, latest dosage, and average interval. */
+export function medicationDoses(e: EntriesSnapshot): ReportResult {
+  const title = "Medication";
+  const days = daysOf(e);
+  if (!e.medication.length) {
+    return empty(title, days, "No medication data found.");
+  }
+  const byName: Record<string, Array<Record<string, unknown>>> = {};
+  for (const m of e.medication) {
+    const name = String(m.name ?? "?");
+    (byName[name] ??= []).push(m);
+  }
+  const rows = Object.keys(byName).sort().map((name) => {
+    const list = [...byName[name]].sort((a, b) =>
+      Date.parse(String(a.time)) - Date.parse(String(b.time))
+    );
+    const latest = list[list.length - 1];
+    const gaps = intervalPairs(list, "time").map((p) => p.gapHours);
+    const avgIntervalH = gaps.length
+      ? round1(gaps.reduce((a, b) => a + b, 0) / gaps.length)
+      : null;
+    return {
+      name,
+      doses: list.length,
+      dosage: `${latest.dosage ?? "?"}${latest.dosage_unit ?? ""}`,
+      avgIntervalH,
+      lastDose: String(latest.time ?? "?"),
+    };
+  });
+  const md = `${header(title, days)}\n\n${
+    table(
+      ["Medication", "Doses", "Latest dosage", "Avg gap", "Last dose"],
+      rows.map((r) => [
+        r.name,
+        String(r.doses),
+        r.dosage,
+        r.avgIntervalH !== null ? `${r.avgIntervalH}h` : "—",
+        r.lastDose,
+      ]),
+    )
+  }`;
+  return { markdown: md, json: { title, days, rows } };
+}
+
+/** Weight measurements over the window with per-reading and net deltas. */
+export function weightTrend(e: EntriesSnapshot): ReportResult {
+  const title = "Weight Trend";
+  const days = daysOf(e);
+  if (!e.weight.length) return empty(title, days, "No weight data found.");
+  const sorted = [...e.weight]
+    .map((w) => ({
+      date: String(w.date ?? "?"),
+      weightKg: round2(Number(w.weight ?? 0)),
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const rows = sorted.map((w, i) => ({
+    date: w.date,
+    weightKg: w.weightKg,
+    deltaKg: i === 0 ? null : round2(w.weightKg - sorted[i - 1].weightKg),
+  }));
+  const net = round2(sorted[sorted.length - 1].weightKg - sorted[0].weightKg);
+  const md = `${header(title, days)}\n\n${
+    table(
+      ["Date", "Weight (kg)", "Δ (kg)"],
+      rows.map((r) => [
+        r.date,
+        String(r.weightKg),
+        r.deltaKg === null
+          ? "—"
+          : (r.deltaKg >= 0 ? `+${r.deltaKg}` : String(r.deltaKg)),
+      ]),
+    )
+  }\n\nNet change: ${
+    net >= 0 ? "+" : ""
+  }${net} kg over ${sorted.length} reading${sorted.length === 1 ? "" : "s"}.`;
+  return { markdown: md, json: { title, days, net, rows } };
 }

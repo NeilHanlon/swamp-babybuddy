@@ -70,6 +70,8 @@ Every `sync` produces all of these (read any with
 - `weight-feeding-correlation` — weight trajectory vs feeding volume
 - `temperature` — all readings in °C and °F
 - `tummy-time` — daily totals and session counts
+- `medication` — per-medication dose counts, latest dosage, avg interval
+- `weight-trend` — weight readings with per-reading and net change
 
 Each report summarizes whatever window the last `sync` pulled (default 7 days).
 

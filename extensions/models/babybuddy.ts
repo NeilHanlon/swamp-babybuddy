@@ -54,6 +54,36 @@ const LoggedSchema = z.object({
   entry: EntrySchema,
 });
 
+const DeletedSchema = z.object({
+  action: z.string(),
+  kind: z.string(),
+  id: z.number(),
+  at: z.iso.datetime(),
+});
+
+/** Tracked entry types and their Baby Buddy REST collection paths. */
+const ENTRY_PATHS: Record<string, string> = {
+  feeding: "feedings/",
+  diaper: "changes/",
+  sleep: "sleep/",
+  pumping: "pumping/",
+  "tummy-time": "tummy-times/",
+  note: "notes/",
+  temperature: "temperature/",
+  medication: "medication/",
+};
+
+const EntryTypeEnum = z.enum([
+  "feeding",
+  "diaper",
+  "sleep",
+  "pumping",
+  "tummy-time",
+  "note",
+  "temperature",
+  "medication",
+]);
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -360,6 +390,7 @@ interface DataHandle {
 /** The subset of the LogTape logger these methods use. */
 interface Logger {
   info: (message: string, properties?: Record<string, unknown>) => void;
+  warning: (message: string, properties?: Record<string, unknown>) => void;
 }
 
 interface MethodContext {
@@ -486,6 +517,19 @@ const SyncArgs = z.object({
   ),
 });
 
+const DeleteEntryArgs = z.object({
+  type: EntryTypeEnum.describe("The kind of entry to delete"),
+  id: z.number().int().describe("Baby Buddy id of the entry to delete"),
+});
+
+const UpdateEntryArgs = z.object({
+  type: EntryTypeEnum.describe("The kind of entry to update"),
+  id: z.number().int().describe("Baby Buddy id of the entry to update"),
+  fields: z.record(z.string(), z.unknown()).describe(
+    "Partial set of fields to change (sent as a PATCH body)",
+  ),
+});
+
 // ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
@@ -493,7 +537,7 @@ const SyncArgs = z.object({
 /** Consolidated Baby Buddy tracker model type. */
 export const model = {
   type: "@kneel/babybuddy",
-  version: "2026.07.10.2",
+  version: "2026.07.10.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     "entries": {
@@ -503,8 +547,14 @@ export const model = {
       garbageCollection: 10,
     },
     "logged": {
-      description: "A single entry created by a log-* method",
+      description: "A single entry created by a log-* or update-entry method",
       schema: LoggedSchema,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
+    "deleted": {
+      description: "Record of an entry removed by delete-entry",
+      schema: DeletedSchema,
       lifetime: "infinite",
       garbageCollection: 50,
     },
@@ -523,6 +573,8 @@ export const model = {
     "@kneel/babybuddy-pumping-amounts",
     "@kneel/babybuddy-temperature",
     "@kneel/babybuddy-tummy-time",
+    "@kneel/babybuddy-medication",
+    "@kneel/babybuddy-weight-trend",
   ],
   checks: {
     "babybuddy-reachable": {
@@ -538,6 +590,8 @@ export const model = {
         "log-note",
         "log-temperature",
         "log-medication",
+        "update-entry",
+        "delete-entry",
       ],
       execute: async (
         context: { globalArgs: GlobalArgs; logger: Logger },
@@ -822,6 +876,75 @@ export const model = {
         if (a.notes) body.notes = a.notes;
         if (a.tags?.length) body.tags = a.tags;
         return postAndLog(context, "medication", "medication/", body);
+      },
+    },
+    "update-entry": {
+      description: "Update fields on an existing Baby Buddy entry",
+      arguments: UpdateEntryArgs,
+      execute: async (
+        a: z.infer<typeof UpdateEntryArgs>,
+        context: MethodContext,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        context.logger.info("Updating {type} entry {id}", {
+          type: a.type,
+          id: a.id,
+        });
+        const entry = await bbRequest(
+          context.globalArgs,
+          "PATCH",
+          `${ENTRY_PATHS[a.type]}${a.id}/`,
+          { body: a.fields },
+        );
+        const handle = await context.writeResource("logged", "logged", {
+          kind: `update:${a.type}`,
+          id: a.id,
+          at: nowIso(),
+          entry,
+        });
+        context.logger.info("Updated {type} entry {id}", {
+          type: a.type,
+          id: a.id,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    "delete-entry": {
+      description: "Delete a Baby Buddy entry by type and id (idempotent)",
+      arguments: DeleteEntryArgs,
+      execute: async (
+        a: z.infer<typeof DeleteEntryArgs>,
+        context: MethodContext,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        context.logger.info("Deleting {type} entry {id}", {
+          type: a.type,
+          id: a.id,
+        });
+        try {
+          await bbRequest(
+            context.globalArgs,
+            "DELETE",
+            `${ENTRY_PATHS[a.type]}${a.id}/`,
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // Idempotent: a 404 means the entry is already gone.
+          if (!/\b404\b/.test(message)) throw err;
+          context.logger.warning("{type} entry {id} already absent", {
+            type: a.type,
+            id: a.id,
+          });
+        }
+        const handle = await context.writeResource("deleted", "deleted", {
+          action: "delete",
+          kind: a.type,
+          id: a.id,
+          at: nowIso(),
+        });
+        context.logger.info("Deleted {type} entry {id}", {
+          type: a.type,
+          id: a.id,
+        });
+        return { dataHandles: [handle] };
       },
     },
   },

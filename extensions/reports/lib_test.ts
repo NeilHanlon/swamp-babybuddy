@@ -8,6 +8,7 @@ import {
   feedingIntervals,
   fmtHM,
   intervalPairs,
+  medicationDoses,
   pumpingAmounts,
   runReport,
   sleepFeedingCorrelation,
@@ -17,6 +18,7 @@ import {
   temperature,
   tummyTime,
   weightFeedingCorrelation,
+  weightTrend,
 } from "./lib.ts";
 
 const fixture: EntriesSnapshot = {
@@ -214,6 +216,68 @@ Deno.test("tummyTime totals minutes", () => {
   ]);
 });
 
+Deno.test("medicationDoses groups by name with dose count and avg interval", () => {
+  const snap = {
+    ...empty,
+    sinceHours: 48,
+    medication: [
+      {
+        name: "Vitamin D",
+        dosage: 1,
+        dosage_unit: "ml",
+        time: "2026-07-10T08:00:00Z",
+      },
+      {
+        name: "Vitamin D",
+        dosage: 1,
+        dosage_unit: "ml",
+        time: "2026-07-11T08:00:00Z",
+      },
+      {
+        name: "Tylenol",
+        dosage: 2.5,
+        dosage_unit: "ml",
+        time: "2026-07-10T14:00:00Z",
+      },
+    ],
+  };
+  assertEquals(medicationDoses(snap).json.rows, [
+    {
+      name: "Tylenol",
+      doses: 1,
+      dosage: "2.5ml",
+      avgIntervalH: null,
+      lastDose: "2026-07-10T14:00:00Z",
+    },
+    {
+      name: "Vitamin D",
+      doses: 2,
+      dosage: "1ml",
+      avgIntervalH: 24,
+      lastDose: "2026-07-11T08:00:00Z",
+    },
+  ]);
+});
+
+Deno.test("weightTrend computes per-reading and net deltas", () => {
+  const snap = {
+    ...empty,
+    sinceHours: 72,
+    weight: [
+      { date: "2026-07-08", weight: 5.10 },
+      { date: "2026-07-10", weight: 5.25 },
+      { date: "2026-07-11", weight: 5.20 },
+    ],
+  };
+  const j = weightTrend(snap).json;
+  assertEquals(j.net, 0.1);
+  assertEquals(j.rows, [
+    { date: "2026-07-08", weightKg: 5.1, deltaKg: null },
+    { date: "2026-07-10", weightKg: 5.25, deltaKg: 0.15 },
+    { date: "2026-07-11", weightKg: 5.2, deltaKg: -0.05 },
+  ]);
+});
+
 Deno.test("runReport returns no-snapshot message when data is missing", async () => {
   const res = await runReport(
     {
@@ -254,6 +318,8 @@ Deno.test("empty snapshots report empty", () => {
       pumpingAmounts,
       temperature,
       tummyTime,
+      medicationDoses,
+      weightTrend,
     ]
   ) {
     assertEquals(fn(empty).json.empty, true);
