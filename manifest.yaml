@@ -1,0 +1,31 @@
+manifestVersion: 1
+name: "@kneel/babybuddy"
+version: "2026.07.10.1"
+description: "Read and write Baby Buddy baby-tracking data (feedings, diapers, sleep, pumping, and more) and generate a consolidated daily summary report."
+
+repository: https://github.com/NeilHanlon/swamp-babybuddy
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - babybuddy.ts
+
+reports:
+  - daily_summary.ts
+  - sleep_feeding_correlation.ts
+  - sleep_longest_stretch.ts
+  - sleep_totals.ts
+  - weight_feeding_correlation.ts
+  - feeding_amounts.ts
+  - feeding_duration.ts
+  - feeding_intervals.ts
+  - diaper_intervals.ts
+  - diaper_types.ts
+  - pumping_amounts.ts
+  - temperature.ts
+  - tummy_time.ts
+
+# Pure network/JS extension — runs anywhere. Empty = universal.
+platforms: []
