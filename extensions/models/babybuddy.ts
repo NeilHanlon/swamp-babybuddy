@@ -357,8 +357,14 @@ interface DataHandle {
   name: string;
 }
 
+/** The subset of the LogTape logger these methods use. */
+interface Logger {
+  info: (message: string, properties?: Record<string, unknown>) => void;
+}
+
 interface MethodContext {
   globalArgs: GlobalArgs;
+  logger: Logger;
   writeResource: (
     specName: string,
     name: string,
@@ -366,18 +372,26 @@ interface MethodContext {
   ) => Promise<DataHandle>;
 }
 
-/** Write a `logged` artifact for a single created entry and return its handle. */
-async function writeLogged(
+/**
+ * POST a new entry to Baby Buddy, log entry/completion, and persist the created
+ * record as a `logged` artifact.
+ */
+async function postAndLog(
   ctx: MethodContext,
   kind: string,
-  entry: Record<string, unknown>,
+  path: string,
+  body: Record<string, unknown>,
 ): Promise<{ dataHandles: DataHandle[] }> {
+  ctx.logger.info("Logging {kind} to Baby Buddy", { kind });
+  const entry = await bbRequest(ctx.globalArgs, "POST", path, { body });
+  const id = (entry.id as number | undefined) ?? null;
   const handle = await ctx.writeResource("logged", "logged", {
     kind,
-    id: (entry.id as number | undefined) ?? null,
+    id,
     at: nowIso(),
     entry,
   });
+  ctx.logger.info("Logged {kind} entry {id}", { kind, id });
   return { dataHandles: [handle] };
 }
 
@@ -479,7 +493,7 @@ const SyncArgs = z.object({
 /** Consolidated Baby Buddy tracker model type. */
 export const model = {
   type: "@kneel/babybuddy",
-  version: "2026.07.10.1",
+  version: "2026.07.10.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     "entries": {
@@ -510,6 +524,42 @@ export const model = {
     "@kneel/babybuddy-temperature",
     "@kneel/babybuddy-tummy-time",
   ],
+  checks: {
+    "babybuddy-reachable": {
+      description:
+        "Verify the Baby Buddy API is reachable and the token resolves a child before writing an entry",
+      labels: ["live"],
+      appliesTo: [
+        "log-feeding",
+        "log-diaper",
+        "log-pumping",
+        "log-sleep",
+        "log-tummy-time",
+        "log-note",
+        "log-temperature",
+        "log-medication",
+      ],
+      execute: async (
+        context: { globalArgs: GlobalArgs; logger: Logger },
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        try {
+          const child = await resolveChild(context.globalArgs);
+          context.logger.info("Baby Buddy reachable (child {child})", {
+            child,
+          });
+          return { pass: true };
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            pass: false,
+            errors: [
+              `Baby Buddy is not reachable or the token/child is invalid: ${message}`,
+            ],
+          };
+        }
+      },
+    },
+  },
   methods: {
     sync: {
       description:
@@ -520,6 +570,9 @@ export const model = {
         context: MethodContext,
       ): Promise<{ dataHandles: DataHandle[] }> => {
         const g = context.globalArgs;
+        context.logger.info("Syncing Baby Buddy entries (last {hours}h)", {
+          hours: args.sinceHours,
+        });
         const child = await resolveChild(g);
         const cutoff = new Date(Date.now() - args.sinceHours * 3_600_000)
           .toISOString();
@@ -595,6 +648,16 @@ export const model = {
           weight: weight.results,
           truncated: lists.some((l) => l.truncated),
         });
+        context.logger.info(
+          "Synced {feedings} feedings, {changes} diapers, {sleep} sleep, {pumping} pumping (truncated={truncated})",
+          {
+            feedings: feedings.results.length,
+            changes: changes.results.length,
+            sleep: sleep.results.length,
+            pumping: pumping.results.length,
+            truncated: lists.some((l) => l.truncated),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -621,8 +684,7 @@ export const model = {
         }
         if (a.notes) body.notes = a.notes;
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "feedings/", { body });
-        return writeLogged(context, "feeding", entry);
+        return postAndLog(context, "feeding", "feedings/", body);
       },
     },
     "log-diaper": {
@@ -644,8 +706,7 @@ export const model = {
         if (a.amount !== undefined) body.amount = a.amount;
         if (a.notes) body.notes = a.notes;
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "changes/", { body });
-        return writeLogged(context, "diaper", entry);
+        return postAndLog(context, "diaper", "changes/", body);
       },
     },
     "log-pumping": {
@@ -667,8 +728,7 @@ export const model = {
         };
         if (a.notes) body.notes = a.notes;
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "pumping/", { body });
-        return writeLogged(context, "pumping", entry);
+        return postAndLog(context, "pumping", "pumping/", body);
       },
     },
     "log-sleep": {
@@ -685,8 +745,7 @@ export const model = {
         if (a.nap !== undefined) body.nap = a.nap;
         if (a.notes) body.notes = a.notes;
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "sleep/", { body });
-        return writeLogged(context, "sleep", entry);
+        return postAndLog(context, "sleep", "sleep/", body);
       },
     },
     "log-tummy-time": {
@@ -702,8 +761,7 @@ export const model = {
         const body: Record<string, unknown> = { child, start, end };
         if (a.milestone) body.milestone = a.milestone;
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "tummy-times/", { body });
-        return writeLogged(context, "tummy-time", entry);
+        return postAndLog(context, "tummy-time", "tummy-times/", body);
       },
     },
     "log-note": {
@@ -721,8 +779,7 @@ export const model = {
           time: a.time ?? nowIso(),
         };
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "notes/", { body });
-        return writeLogged(context, "note", entry);
+        return postAndLog(context, "note", "notes/", body);
       },
     },
     "log-temperature": {
@@ -742,8 +799,7 @@ export const model = {
         };
         if (a.notes) body.notes = a.notes;
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "temperature/", { body });
-        return writeLogged(context, "temperature", entry);
+        return postAndLog(context, "temperature", "temperature/", body);
       },
     },
     "log-medication": {
@@ -765,8 +821,7 @@ export const model = {
         if (a.nextDoseInterval) body.next_dose_interval = a.nextDoseInterval;
         if (a.notes) body.notes = a.notes;
         if (a.tags?.length) body.tags = a.tags;
-        const entry = await bbRequest(g, "POST", "medication/", { body });
-        return writeLogged(context, "medication", entry);
+        return postAndLog(context, "medication", "medication/", body);
       },
     },
   },
