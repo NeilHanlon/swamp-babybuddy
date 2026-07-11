@@ -17,9 +17,9 @@ const GlobalArgsSchema = z.object({
   baseUrl: z.url().describe(
     "Baby Buddy base URL, e.g. https://baby.example.com",
   ),
-  token: z.string().min(1).describe("Baby Buddy API token").meta({
-    sensitive: true,
-  }),
+  token: z.string().min(1).meta({ sensitive: true }).describe(
+    "Baby Buddy API token",
+  ),
   childId: z.number().int().optional().describe(
     "Child ID to operate on; if omitted, the first child is used",
   ),

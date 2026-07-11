@@ -9,6 +9,7 @@ import {
   fmtHM,
   intervalPairs,
   pumpingAmounts,
+  runReport,
   sleepFeedingCorrelation,
   sleepLongestStretch,
   sleepTotals,
@@ -211,6 +212,34 @@ Deno.test("tummyTime totals minutes", () => {
   assertEquals(tummyTime(fixture).json.rows, [
     { date: "2026-07-10", totalMin: 5, sessions: 1 },
   ]);
+});
+
+Deno.test("runReport returns no-snapshot message when data is missing", async () => {
+  const res = await runReport(
+    {
+      modelType: "t",
+      modelId: "m",
+      dataRepository: { getContent: () => null },
+    },
+    sleepTotals,
+  );
+  assertEquals(
+    (res.json as { message?: string }).message,
+    "no entries snapshot",
+  );
+});
+
+Deno.test("runReport decodes the snapshot and dispatches to compute", async () => {
+  const bytes = new TextEncoder().encode(JSON.stringify(fixture));
+  const res = await runReport(
+    {
+      modelType: "t",
+      modelId: "m",
+      dataRepository: { getContent: () => bytes },
+    },
+    sleepTotals,
+  );
+  assertEquals(res.json.rows, sleepTotals(fixture).json.rows);
 });
 
 Deno.test("empty snapshots report empty", () => {

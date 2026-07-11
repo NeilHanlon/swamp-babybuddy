@@ -1,0 +1,17 @@
+import { assertEquals } from "jsr:@std/assert@1";
+import { report } from "./tummy_time.ts";
+
+Deno.test("tummy_time report identity and no-snapshot path", async () => {
+  assertEquals(report.name, "@kneel/babybuddy-tummy-time");
+  assertEquals(report.scope, "model");
+  assertEquals(Array.isArray(report.labels), true);
+  const res = await report.execute({
+    modelType: "t",
+    modelId: "m",
+    dataRepository: { getContent: () => null },
+  });
+  assertEquals(
+    (res.json as { message?: string }).message,
+    "no entries snapshot",
+  );
+});
