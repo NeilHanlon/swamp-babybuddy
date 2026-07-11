@@ -3,6 +3,7 @@ import {
   aggregateByDate,
   buildDailySummary,
   dateFromIso,
+  inferTimerKind,
   parseDurationHours,
 } from "./babybuddy.ts";
 
@@ -88,4 +89,15 @@ Deno.test("buildDailySummary aggregates a day across types", () => {
   assertEquals(row.diapers, { count: 2, wet: 2, solid: 1 });
   assertEquals(row.pumping, { sessions: 1, ml: 120 });
   assertEquals(row.weightKg, 5.25);
+});
+
+Deno.test("inferTimerKind maps names to activities", () => {
+  assertEquals(inferTimerKind("Feeding"), "feeding");
+  assertEquals(inferTimerKind("nap"), "sleep");
+  assertEquals(inferTimerKind("night sleep"), "sleep");
+  assertEquals(inferTimerKind("Pumping session"), "pumping");
+  assertEquals(inferTimerKind("tummy time"), "tummy-time");
+  assertEquals(inferTimerKind("Timer 1"), null);
+  assertEquals(inferTimerKind(null), null);
+  assertEquals(inferTimerKind(42), null);
 });

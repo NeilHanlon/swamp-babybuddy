@@ -61,6 +61,19 @@ const DeletedSchema = z.object({
   at: z.iso.datetime(),
 });
 
+const TimerSchema = z.object({
+  action: z.string(),
+  id: z.number(),
+  name: z.string().nullable(),
+  start: z.string(),
+  at: z.iso.datetime(),
+});
+
+const TimersSchema = z.object({
+  fetchedAt: z.iso.datetime(),
+  timers: z.array(EntrySchema),
+});
+
 /** Tracked entry types and their Baby Buddy REST collection paths. */
 const ENTRY_PATHS: Record<string, string> = {
   feeding: "feedings/",
@@ -152,6 +165,48 @@ async function resolveChild(args: GlobalArgs): Promise<number> {
   const { results } = await bbList(args, "children/", { limit: 1 });
   if (results.length === 0) throw new Error("No children found in Baby Buddy");
   return results[0].id as number;
+}
+
+/** Fetch the target timer by id, by name, or the most recently started one. */
+async function resolveTimer(
+  args: GlobalArgs,
+  opts: { timerId?: number; name?: string },
+): Promise<Record<string, unknown>> {
+  if (opts.timerId !== undefined) {
+    return await bbRequest(args, "GET", `timers/${opts.timerId}/`);
+  }
+  if (opts.name) {
+    const { results } = await bbList(args, "timers/", {
+      name: opts.name,
+      limit: 10,
+    });
+    if (!results.length) {
+      throw new Error(`No active timer found with name '${opts.name}'`);
+    }
+    return results[0];
+  }
+  const { results } = await bbList(args, "timers/", {
+    limit: 1,
+    ordering: "-start",
+  });
+  if (!results.length) throw new Error("No active timers found");
+  return results[0];
+}
+
+/**
+ * Guess which activity a timer converts into from its name. Returns null when
+ * the name gives no hint, so the caller can require an explicit choice rather
+ * than silently discard a running timer.
+ */
+export function inferTimerKind(
+  name: unknown,
+): "feeding" | "sleep" | "pumping" | "tummy-time" | null {
+  const n = typeof name === "string" ? name.toLowerCase() : "";
+  if (n.includes("feed")) return "feeding";
+  if (n.includes("nap") || n.includes("sleep")) return "sleep";
+  if (n.includes("pump")) return "pumping";
+  if (n.includes("tummy")) return "tummy-time";
+  return null;
 }
 
 function nowIso(): string {
@@ -530,6 +585,45 @@ const UpdateEntryArgs = z.object({
   ),
 });
 
+const StartTimerArgs = z.object({
+  name: z.string().optional().describe(
+    "Timer name; a name like 'feeding'/'sleep'/'pumping'/'tummy' lets stop-timer auto-convert",
+  ),
+});
+
+const ListTimersArgs = z.object({});
+
+const RenameTimerArgs = z.object({
+  timerId: z.number().int().optional(),
+  name: z.string().optional().describe(
+    "Current name (used if timerId omitted)",
+  ),
+  newName: z.string().describe("New timer name"),
+});
+
+const StopTimerArgs = z.object({
+  timerId: z.number().int().optional().describe(
+    "Timer to stop; if omitted, resolved by name or the most recent timer",
+  ),
+  name: z.string().optional(),
+  createEntry: z.enum(["feeding", "pumping", "sleep", "tummy-time", "discard"])
+    .optional().describe(
+      "What to convert the timer into. Omit to infer from the timer name; use 'discard' to delete without an entry",
+    ),
+  method: z.string().optional().describe(
+    "feeding: left/right/both breasts, bottle, ...",
+  ),
+  type: z.string().default("breast milk").describe(
+    "feeding: breast milk | formula | fortified breast milk | solid food",
+  ),
+  amount: z.number().optional(),
+  amountUnit: z.string().default("ml"),
+  nap: z.boolean().optional().describe("sleep: mark as nap"),
+  milestone: z.string().optional().describe("tummy-time: milestone note"),
+  notes: z.string().optional(),
+  tags,
+});
+
 // ---------------------------------------------------------------------------
 // Model definition
 // ---------------------------------------------------------------------------
@@ -537,7 +631,7 @@ const UpdateEntryArgs = z.object({
 /** Consolidated Baby Buddy tracker model type. */
 export const model = {
   type: "@kneel/babybuddy",
-  version: "2026.07.10.3",
+  version: "2026.07.10.4",
   globalArguments: GlobalArgsSchema,
   resources: {
     "entries": {
@@ -557,6 +651,18 @@ export const model = {
       schema: DeletedSchema,
       lifetime: "infinite",
       garbageCollection: 50,
+    },
+    "timer": {
+      description: "A timer started or renamed by a timer method",
+      schema: TimerSchema,
+      lifetime: "infinite",
+      garbageCollection: 50,
+    },
+    "timers": {
+      description: "Snapshot of active timers from list-timers",
+      schema: TimersSchema,
+      lifetime: "30d",
+      garbageCollection: 10,
     },
   },
   reports: [
@@ -592,6 +698,9 @@ export const model = {
         "log-medication",
         "update-entry",
         "delete-entry",
+        "start-timer",
+        "stop-timer",
+        "rename-timer",
       ],
       execute: async (
         context: { globalArgs: GlobalArgs; logger: Logger },
@@ -943,6 +1052,172 @@ export const model = {
         context.logger.info("Deleted {type} entry {id}", {
           type: a.type,
           id: a.id,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    "start-timer": {
+      description: "Start a Baby Buddy timer (name it to enable auto-convert)",
+      arguments: StartTimerArgs,
+      execute: async (
+        a: z.infer<typeof StartTimerArgs>,
+        context: MethodContext,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const child = await resolveChild(g);
+        context.logger.info("Starting timer {name}", {
+          name: a.name ?? "(unnamed)",
+        });
+        const body: Record<string, unknown> = { child, start: nowIso() };
+        if (a.name) body.name = a.name;
+        const timer = await bbRequest(g, "POST", "timers/", { body });
+        const handle = await context.writeResource("timer", "timer", {
+          action: "start",
+          id: timer.id as number,
+          name: (timer.name as string | null) ?? null,
+          start: String(timer.start),
+          at: nowIso(),
+        });
+        context.logger.info("Started timer {id}", { id: timer.id });
+        return { dataHandles: [handle] };
+      },
+    },
+    "stop-timer": {
+      description:
+        "Stop a timer and convert it into its activity (or discard it)",
+      arguments: StopTimerArgs,
+      execute: async (
+        a: z.infer<typeof StopTimerArgs>,
+        context: MethodContext,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const timer = await resolveTimer(g, {
+          timerId: a.timerId,
+          name: a.name,
+        });
+        const tid = timer.id as number;
+        // Decide what to do: explicit createEntry, else infer from the name.
+        // Never silently discard — an unnamed timer with no createEntry errors.
+        let kind = a.createEntry;
+        if (!kind) {
+          const inferred = inferTimerKind(timer.name);
+          if (!inferred) {
+            throw new Error(
+              `Cannot infer an activity from timer '${
+                timer.name ?? ""
+              }' (id ${tid}). Pass createEntry=feeding|pumping|sleep|tummy-time, or createEntry=discard to delete it.`,
+            );
+          }
+          kind = inferred;
+        }
+
+        if (kind === "discard") {
+          context.logger.info("Discarding timer {id}", { id: tid });
+          await bbRequest(g, "DELETE", `timers/${tid}/`);
+          const handle = await context.writeResource("deleted", "deleted", {
+            action: "discard",
+            kind: "timer",
+            id: tid,
+            at: nowIso(),
+          });
+          return { dataHandles: [handle] };
+        }
+
+        // Convert: POST to the activity with `timer` so Baby Buddy uses the
+        // timer's start/end and consumes the timer.
+        const child = await resolveChild(g);
+        const body: Record<string, unknown> = { child, timer: tid };
+        if (kind === "feeding") {
+          body.type = a.type;
+          body.method = a.method || "both breasts";
+          if (a.amount !== undefined) {
+            body.amount = a.amount;
+            body.amount_unit = a.amountUnit;
+          }
+        } else if (kind === "pumping") {
+          if (a.amount === undefined) {
+            throw new Error(
+              "amount is required to convert a timer into a pumping entry",
+            );
+          }
+          body.amount = a.amount;
+          body.amount_unit = a.amountUnit;
+        } else if (kind === "sleep") {
+          if (a.nap !== undefined) body.nap = a.nap;
+        } else if (kind === "tummy-time") {
+          if (a.milestone) body.milestone = a.milestone;
+        }
+        if (a.notes) body.notes = a.notes;
+        if (a.tags?.length) body.tags = a.tags;
+
+        context.logger.info("Converting timer {id} into {kind}", {
+          id: tid,
+          kind,
+        });
+        const entry = await bbRequest(g, "POST", ENTRY_PATHS[kind], { body });
+        const handle = await context.writeResource("logged", "logged", {
+          kind,
+          id: (entry.id as number | undefined) ?? null,
+          at: nowIso(),
+          entry,
+        });
+        context.logger.info("Converted timer {id} into {kind} entry {eid}", {
+          id: tid,
+          kind,
+          eid: entry.id,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    "rename-timer": {
+      description: "Rename an active timer (e.g. to enable auto-convert)",
+      arguments: RenameTimerArgs,
+      execute: async (
+        a: z.infer<typeof RenameTimerArgs>,
+        context: MethodContext,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        const timer = await resolveTimer(g, {
+          timerId: a.timerId,
+          name: a.name,
+        });
+        const tid = timer.id as number;
+        context.logger.info("Renaming timer {id} to {newName}", {
+          id: tid,
+          newName: a.newName,
+        });
+        const updated = await bbRequest(g, "PATCH", `timers/${tid}/`, {
+          body: { name: a.newName },
+        });
+        const handle = await context.writeResource("timer", "timer", {
+          action: "rename",
+          id: tid,
+          name: (updated.name as string | null) ?? null,
+          start: String(updated.start),
+          at: nowIso(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    "list-timers": {
+      description: "Snapshot the active timers into `timers` (read-only)",
+      arguments: ListTimersArgs,
+      execute: async (
+        _a: z.infer<typeof ListTimersArgs>,
+        context: MethodContext,
+      ): Promise<{ dataHandles: DataHandle[] }> => {
+        const g = context.globalArgs;
+        context.logger.info("Listing active timers");
+        const { results } = await bbList(g, "timers/", {
+          limit: 50,
+          ordering: "-start",
+        });
+        const handle = await context.writeResource("timers", "timers", {
+          fetchedAt: nowIso(),
+          timers: results,
+        });
+        context.logger.info("Found {count} active timer(s)", {
+          count: results.length,
         });
         return { dataHandles: [handle] };
       },

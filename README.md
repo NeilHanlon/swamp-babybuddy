@@ -50,7 +50,25 @@ swamp model method run connor log-feeding \
 
 # View the consolidated daily summary produced after sync
 swamp report get @kneel/babybuddy-daily-summary --model connor --markdown
+
+# Timers: start one, then close it into its activity when you're done.
+# A named timer auto-converts; stop-timer never silently discards.
+swamp model method run connor start-timer --input name=sleep
+swamp model method run connor stop-timer            # infers "sleep", creates the sleep entry
+swamp model method run connor stop-timer --input createEntry=discard   # explicit throw-away
 ```
+
+## Methods
+
+- `sync` — pull recent activity into the `entries` snapshot (drives all reports)
+- `log-feeding` / `log-diaper` / `log-sleep` / `log-pumping` / `log-tummy-time` /
+  `log-note` / `log-temperature` / `log-medication` — create entries
+- `update-entry` / `delete-entry` — edit or remove an entry by type + id
+  (delete is idempotent)
+- `start-timer` / `stop-timer` / `rename-timer` / `list-timers` — timers;
+  `stop-timer` converts the timer into a feeding/pumping/sleep/tummy-time entry
+  (Baby Buddy uses the timer's start/end and consumes it), inferring the type
+  from the timer name unless you pass `createEntry`
 
 ## Reports
 
