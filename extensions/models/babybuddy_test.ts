@@ -1,11 +1,40 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
   aggregateByDate,
+  backdatePatch,
   buildDailySummary,
   dateFromIso,
   inferTimerKind,
   parseDurationHours,
 } from "./babybuddy.ts";
+
+Deno.test("backdatePatch: no start/end -> null (no extra PATCH, backward compatible)", () => {
+  assertEquals(backdatePatch({}), null);
+});
+
+Deno.test("backdatePatch: end only patches end (the forgotten-timer case)", () => {
+  assertEquals(
+    backdatePatch({ end: "2026-07-10T08:50:00Z" }),
+    { end: "2026-07-10T08:50:00Z" },
+  );
+});
+
+Deno.test("backdatePatch: start only patches start", () => {
+  assertEquals(
+    backdatePatch({ start: "2026-07-10T07:22:00Z" }),
+    { start: "2026-07-10T07:22:00Z" },
+  );
+});
+
+Deno.test("backdatePatch: both start and end are patched", () => {
+  assertEquals(
+    backdatePatch({
+      start: "2026-07-10T07:22:00Z",
+      end: "2026-07-10T08:50:00Z",
+    }),
+    { start: "2026-07-10T07:22:00Z", end: "2026-07-10T08:50:00Z" },
+  );
+});
 
 Deno.test("parseDurationHours parses HH:MM:SS", () => {
   assertEquals(parseDurationHours("1:30:00"), 1.5);

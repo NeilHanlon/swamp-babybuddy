@@ -86,6 +86,22 @@ const ENTRY_PATHS: Record<string, string> = {
   medication: "medication/",
 };
 
+/**
+ * Build the PATCH body used to backdate a timer-converted entry.
+ * Converting via the `timer` param links the entry to its timer (Baby Buddy
+ * provenance) but forces start=timer.start / end=now; we PATCH only the
+ * caller-supplied fields on top. Returns null when nothing was supplied, so
+ * the no-backdate path issues zero extra requests and is unchanged.
+ */
+export function backdatePatch(
+  a: { start?: string; end?: string },
+): Record<string, unknown> | null {
+  const patch: Record<string, unknown> = {};
+  if (a.start !== undefined) patch.start = a.start;
+  if (a.end !== undefined) patch.end = a.end;
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
 const EntryTypeEnum = z.enum([
   "feeding",
   "diaper",
@@ -620,6 +636,12 @@ const StopTimerArgs = z.object({
   amountUnit: z.string().default("ml"),
   nap: z.boolean().optional().describe("sleep: mark as nap"),
   milestone: z.string().optional().describe("tummy-time: milestone note"),
+  start: z.string().optional().describe(
+    "ISO-8601 start to backdate the converted entry to; PATCHed onto the entry after conversion (Baby Buddy otherwise keeps the timer's own start)",
+  ),
+  end: z.string().optional().describe(
+    "ISO-8601 end for the converted entry; PATCHed on after conversion so a forgotten timer isn't closed at 'now'. The entry briefly has end='now' between the convert POST and this PATCH; the timer link (provenance) is preserved either way",
+  ),
   notes: z.string().optional(),
   tags,
 });
@@ -1155,16 +1177,42 @@ export const model = {
           kind,
         });
         const entry = await bbRequest(g, "POST", ENTRY_PATHS[kind], { body });
+        // Convert via the `timer` param keeps the entry LINKED to its timer
+        // (Baby Buddy's provenance) but forces start=timer.start, end=now. To
+        // honour a caller-supplied start/end we PATCH the freshly-created entry
+        // rather than deleting the timer (which would drop that provenance).
+        let finalEntry = entry;
+        const patch = backdatePatch(a);
+        if (patch) {
+          const eid = entry.id as number | undefined;
+          if (eid === undefined) {
+            throw new Error(
+              `Converted ${kind} entry has no id; cannot backdate start/end`,
+            );
+          }
+          context.logger.info("Backdating {kind} entry {eid}", {
+            kind,
+            eid,
+          });
+          finalEntry = await bbRequest(
+            g,
+            "PATCH",
+            `${ENTRY_PATHS[kind]}${eid}/`,
+            {
+              body: patch,
+            },
+          );
+        }
         const handle = await context.writeResource("logged", "logged", {
           kind,
-          id: (entry.id as number | undefined) ?? null,
+          id: (finalEntry.id as number | undefined) ?? null,
           at: nowIso(),
-          entry,
+          entry: finalEntry,
         });
         context.logger.info("Converted timer {id} into {kind} entry {eid}", {
           id: tid,
           kind,
-          eid: entry.id,
+          eid: finalEntry.id,
         });
         return { dataHandles: [handle] };
       },
