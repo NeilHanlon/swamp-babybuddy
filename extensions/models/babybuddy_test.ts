@@ -1,10 +1,12 @@
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import { z } from "npm:zod@4";
 import {
   aggregateByDate,
   backdatePatch,
   buildDailySummary,
   dateFromIso,
   inferTimerKind,
+  jsonish,
   parseDurationHours,
 } from "./babybuddy.ts";
 
@@ -118,6 +120,34 @@ Deno.test("buildDailySummary aggregates a day across types", () => {
   assertEquals(row.diapers, { count: 2, wet: 2, solid: 1 });
   assertEquals(row.pumping, { sessions: 1, ml: 120 });
   assertEquals(row.weightKg, 5.25);
+});
+
+Deno.test("jsonish: parses a JSON-string record (the --input path)", () => {
+  const schema = jsonish(z.record(z.string(), z.unknown()));
+  assertEquals(schema.parse('{"amount":110.85}'), { amount: 110.85 });
+});
+
+Deno.test("jsonish: passes through an already-parsed record (the --stdin path)", () => {
+  const schema = jsonish(z.record(z.string(), z.unknown()));
+  assertEquals(schema.parse({ amount: 110.85 }), { amount: 110.85 });
+});
+
+Deno.test("jsonish: parses a JSON-string array (tags via --input)", () => {
+  const schema = jsonish(z.array(z.string()));
+  assertEquals(schema.parse('["gas","fussy"]'), ["gas", "fussy"]);
+  assertEquals(schema.parse(["gas", "fussy"]), ["gas", "fussy"]);
+});
+
+Deno.test("jsonish: malformed JSON still fails validation", () => {
+  const schema = jsonish(z.record(z.string(), z.unknown()));
+  assertThrows(() => schema.parse("{not json"));
+});
+
+Deno.test("jsonish: non-JSON-looking string is left for the inner schema", () => {
+  // A scalar string is not {..}/[..], so it passes through and the record
+  // schema rejects it — same behavior as before the wrapper.
+  const schema = jsonish(z.record(z.string(), z.unknown()));
+  assertThrows(() => schema.parse("just a string"));
 });
 
 Deno.test("inferTimerKind maps names to activities", () => {

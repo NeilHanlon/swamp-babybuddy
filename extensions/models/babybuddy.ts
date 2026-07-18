@@ -501,7 +501,29 @@ async function postAndLog(
 // Method argument schemas
 // ---------------------------------------------------------------------------
 
-const tags = z.array(z.string()).optional().describe("Tag names");
+/**
+ * Wrap a schema so object/array inputs can also arrive as a JSON string.
+ *
+ * `swamp model method run ... --input key=value` always delivers the value as a
+ * string, so structured args (records, arrays) would otherwise fail validation
+ * with "expected record/array, received string". The `--stdin` path delivers
+ * already-parsed values, which pass through untouched. Only strings that look
+ * like JSON (`{...}` / `[...]`) are parsed; scalars and malformed JSON fall
+ * through so the wrapped schema still produces its normal error.
+ */
+export const jsonish = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess((v) => {
+    if (typeof v !== "string") return v;
+    const s = v.trim();
+    if (!(s.startsWith("{") || s.startsWith("["))) return v;
+    try {
+      return JSON.parse(s);
+    } catch {
+      return v;
+    }
+  }, schema);
+
+const tags = jsonish(z.array(z.string())).optional().describe("Tag names");
 
 const FeedingArgs = z.object({
   method: z.string().describe(
@@ -596,7 +618,7 @@ const DeleteEntryArgs = z.object({
 const UpdateEntryArgs = z.object({
   type: EntryTypeEnum.describe("The kind of entry to update"),
   id: z.number().int().describe("Baby Buddy id of the entry to update"),
-  fields: z.record(z.string(), z.unknown()).describe(
+  fields: jsonish(z.record(z.string(), z.unknown())).describe(
     "Partial set of fields to change (sent as a PATCH body)",
   ),
 });
@@ -653,7 +675,7 @@ const StopTimerArgs = z.object({
 /** Consolidated Baby Buddy tracker model type. */
 export const model = {
   type: "@kneel/babybuddy",
-  version: "2026.07.10.4",
+  version: "2026.07.18.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     "entries": {
