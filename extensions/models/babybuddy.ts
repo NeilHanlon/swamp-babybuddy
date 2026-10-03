@@ -777,13 +777,46 @@ const StopTimerArgs = z.object({
 /** Consolidated Baby Buddy tracker model type. */
 export const model = {
   type: "@kneel/babybuddy",
-  version: "2026.10.03.1",
+  version: "2026.10.03.2",
   globalArguments: GlobalArgsSchema,
+  // Full type-version lineage. globalArguments (baseUrl/token/childId) has been
+  // stable across every version, so each migration is an identity on attributes;
+  // the descriptions double as a per-version changelog (see CHANGELOG.md).
   upgrades: [
+    {
+      toVersion: "2026.07.10.2",
+      description:
+        "Per-method logging and a babybuddy-reachable live pre-flight check.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.10.3",
+      description:
+        "delete-entry / update-entry methods (delete idempotent); medication and weight-trend reports.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.10.4",
+      description:
+        "Timer methods (start/stop/rename/list) with convert-timer-into-activity.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.18.1",
+      description:
+        "stop-timer backdates a converted entry via convert-then-PATCH; methods accept JSON-string object/array inputs.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
     {
       toVersion: "2026.10.03.1",
       description:
-        "Paginated sync (drains the >500-record/type cap with dedup + retry) and a tolerant `truncated` default on the entries snapshot. No globalArguments schema change — config carries over unchanged.",
+        "Paginated sync (drains the >500-record/type cap with dedup + retry) and a tolerant `truncated` default on the entries snapshot.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.03.2",
+      description:
+        "Docs-only: CHANGELOG + backfilled upgrade lineage. No functional change.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
