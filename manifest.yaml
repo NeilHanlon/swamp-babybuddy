@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@kneel/babybuddy"
-version: "2026.07.18.1"
-description: "Read and write Baby Buddy baby-tracking data (feedings, diapers, sleep, pumping, and more) and generate a consolidated daily summary report."
+version: "2026.10.03.1"
+description: "Read and write Baby Buddy baby-tracking data (feedings, diapers, sleep, pumping, weight, and more) with paginated sync, and generate a suite of analysis reports — a consolidated daily summary plus sleep (totals, longest stretch, feeding correlation, regression watch), feeding, diaper, pumping, temperature, tummy-time, medication, and weight-trend reports."
 
 repository: https://github.com/NeilHanlon/swamp-babybuddy
 
@@ -16,6 +16,7 @@ reports:
   - daily_summary.ts
   - sleep_feeding_correlation.ts
   - sleep_longest_stretch.ts
+  - sleep_regression_watch.ts
   - sleep_totals.ts
   - weight_feeding_correlation.ts
   - feeding_amounts.ts

@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import type { EntriesSnapshot } from "../models/babybuddy.ts";
 import {
   diaperIntervals,
@@ -10,7 +10,9 @@ import {
   intervalPairs,
   medicationDoses,
   pumpingAmounts,
+  regressionWatch,
   runReport,
+  safetyNotes,
   sleepFeedingCorrelation,
   sleepLongestStretch,
   sleepTotals,
@@ -320,8 +322,414 @@ Deno.test("empty snapshots report empty", () => {
       tummyTime,
       medicationDoses,
       weightTrend,
+      regressionWatch,
     ]
   ) {
     assertEquals(fn(empty).json.empty, true);
   }
+});
+
+// --- Sleep Regression Watch ------------------------------------------------
+
+/** Add `delta` days to a YYYY-MM-DD date (UTC-safe). */
+function ad(date: string, delta: number): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Hours → "H:MM:SS". */
+function dur(h: number): string {
+  const hh = Math.floor(h);
+  const mm = Math.round((h - hh) * 60);
+  return `${hh}:${String(mm).padStart(2, "0")}:00`;
+}
+
+/**
+ * Build the sleep sessions for one night, all ending in the early-morning hours
+ * of `night + 1` (so they attribute to `night`). The first session is the
+ * longest stretch; the remaining `wakes` sessions are short fillers (0.75h) so
+ * the night total clears the sparse floor unless `sparse` forces it under.
+ */
+function nightSessions(
+  night: string,
+  longestH: number,
+  wakes: number,
+  sparse = false,
+): Array<Record<string, unknown>> {
+  const morning = ad(night, 1);
+  const fillerH = sparse ? 0.25 : 0.75;
+  const out: Array<Record<string, unknown>> = [
+    {
+      start: `${morning}T00:00:00Z`,
+      end: `${morning}T01:00:00Z`,
+      duration: dur(longestH),
+      nap: false,
+    },
+  ];
+  for (let i = 0; i < wakes; i++) {
+    const hour = String(i + 2).padStart(2, "0"); // 02, 03, ... (< 08)
+    out.push({
+      start: `${morning}T${hour}:00:00Z`,
+      end: `${morning}T${hour}:30:00Z`,
+      duration: dur(fillerH),
+      nap: false,
+    });
+  }
+  return out;
+}
+
+const LATEST = "2026-09-13";
+
+/** Snapshot with a uniform baseline; `recent` overrides the last 7 nights. */
+function watchSnapshot(
+  recent: Array<
+    { k: number; longestH: number; wakes: number; sparse?: boolean }
+  >,
+): EntriesSnapshot {
+  const sleep: Array<Record<string, unknown>> = [];
+  // 12 uniform baseline nights (longest 3.5h, 2 wakes) inside [latest-27, latest-7].
+  for (let k = 7; k <= 18; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 3.5, 2));
+  }
+  for (const r of recent) {
+    sleep.push(
+      ...nightSessions(ad(LATEST, -r.k), r.longestH, r.wakes, r.sparse),
+    );
+  }
+  return {
+    ...empty,
+    fetchedAt: "2026-09-14T12:00:00Z",
+    sinceHours: 720,
+    sleep,
+  };
+}
+
+Deno.test("regressionWatch flags a sustained regression (stretch↓ AND wakes↑)", () => {
+  // Recent: 4 normal nights then 3 regression nights (short stretch, many wakes).
+  const snap = watchSnapshot([
+    { k: 6, longestH: 3.5, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 1.5, wakes: 5 },
+    { k: 1, longestH: 1.5, wakes: 5 },
+    { k: 0, longestH: 1.5, wakes: 5 },
+  ]);
+  const j = regressionWatch(snap).json as Record<string, unknown>;
+  assertEquals(j.status, "regression");
+  assertEquals((j.baseline as { nights: number }).nights, 12);
+  // Uniform baseline ⇒ σ=0 ⇒ thresholds equal the baseline means.
+  assertEquals(j.thresholds, {
+    stretchLowH: 3.5,
+    wakesHighCount: 2,
+    absoluteTriggerH: 2.67,
+  });
+  const recent = j.recent as Array<Record<string, unknown>>;
+  assertEquals(recent.length, 7);
+  assertEquals(recent[6].nightDate, LATEST);
+  assertEquals(recent[6].stretchLow, true);
+  assertEquals(recent[6].wakesHigh, true);
+  assertEquals(recent[0].stretchLow, false);
+});
+
+Deno.test("regressionWatch labels a single-condition run as nap_fragmentation", () => {
+  // Wakes spike but the longest stretch holds ⇒ fragmentation, not regression.
+  const snap = watchSnapshot([
+    { k: 6, longestH: 3.5, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 3.5, wakes: 5 },
+    { k: 1, longestH: 3.5, wakes: 5 },
+    { k: 0, longestH: 3.5, wakes: 5 },
+  ]);
+  assertEquals(regressionWatch(snap).json.status, "nap_fragmentation");
+});
+
+Deno.test("regressionWatch reports normal when recent tracks baseline", () => {
+  const snap = watchSnapshot([
+    { k: 6, longestH: 3.5, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 3.5, wakes: 2 },
+    { k: 1, longestH: 3.5, wakes: 2 },
+    { k: 0, longestH: 3.5, wakes: 2 },
+  ]);
+  assertEquals(regressionWatch(snap).json.status, "normal");
+});
+
+Deno.test("regressionWatch raises 'watch' on 3 soft breaches, but not on 2 with a flat trend", () => {
+  // 3 non-consecutive soft breaches (no 3-night hard run) ⇒ watch.
+  const three = watchSnapshot([
+    { k: 6, longestH: 3.5, wakes: 3 }, // breach
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 3 }, // breach
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 3.5, wakes: 3 }, // breach
+    { k: 1, longestH: 3.5, wakes: 2 },
+    { k: 0, longestH: 3.5, wakes: 2 },
+  ]);
+  const j = regressionWatch(three).json;
+  assertEquals(j.status, "watch");
+  assertEquals(j.watchNights, 3);
+
+  // Only 2 breaches and a flat trend ⇒ raised bar not met ⇒ normal (no crying wolf).
+  const two = watchSnapshot([
+    { k: 6, longestH: 3.5, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 3.5, wakes: 3 }, // breach
+    { k: 1, longestH: 3.5, wakes: 2 },
+    { k: 0, longestH: 3.5, wakes: 3 }, // breach (non-consecutive), flat trend
+  ]);
+  assertEquals(regressionWatch(two).json.status, "normal");
+});
+
+Deno.test("regressionWatch excludes sparse nights", () => {
+  const snap = watchSnapshot([
+    { k: 6, longestH: 3.5, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 1.5, wakes: 5 },
+    { k: 1, longestH: 0.5, wakes: 0, sparse: true }, // total < 4h ⇒ excluded
+    { k: 0, longestH: 1.5, wakes: 5 },
+  ]);
+  const recent = regressionWatch(snap).json.recent as Array<
+    Record<string, unknown>
+  >;
+  const sparse = recent.find((r) => r.nightDate === ad(LATEST, -1))!;
+  assertEquals(sparse.excluded, true);
+});
+
+Deno.test("regressionWatch returns insufficient_data without enough baseline", () => {
+  // Only a handful of recent nights, no baseline history.
+  const sleep: Array<Record<string, unknown>> = [];
+  for (let k = 0; k <= 3; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 3.5, 2));
+  }
+  const snap: EntriesSnapshot = {
+    ...empty,
+    fetchedAt: "2026-09-14T12:00:00Z",
+    sinceHours: 168,
+    sleep,
+  };
+  assertEquals(regressionWatch(snap).json.status, "insufficient_data");
+});
+
+Deno.test("regressionWatch keeps overnight blocks ending in the morning (~08:15)", () => {
+  // With a hard 08:00 cutoff this healthy 9h block would vanish entirely.
+  const snap: EntriesSnapshot = {
+    ...empty,
+    fetchedAt: "2026-09-14T18:00:00Z",
+    sinceHours: 720,
+    sleep: [{
+      start: "2026-09-13T23:00:00Z",
+      end: "2026-09-14T08:15:00Z",
+      duration: "9:15:00",
+    }],
+  };
+  const recent = regressionWatch(snap).json.recent as Array<
+    Record<string, unknown>
+  >;
+  const night = recent.find((r) => r.nightDate === "2026-09-13")!;
+  assertEquals(night.longestStretchH, 9.25);
+  assertEquals(night.excluded, false);
+});
+
+Deno.test("regressionWatch judges completeness by instant, not naive wall clock", () => {
+  // Child at UTC-04:00. Sessions end 05:00 local; sync ran 07:00 local (11:00Z),
+  // before the 09:00-local morning boundary ⇒ the night is still incomplete.
+  const base = {
+    ...empty,
+    sinceHours: 720,
+    sleep: [
+      {
+        start: "2026-09-14T01:00:00-04:00",
+        end: "2026-09-14T05:00:00-04:00",
+        duration: "4:00:00",
+      },
+      {
+        start: "2026-09-14T00:00:00-04:00",
+        end: "2026-09-14T00:30:00-04:00",
+        duration: "0:30:00",
+      },
+    ],
+  };
+  const findNight = (snap: EntriesSnapshot) =>
+    (regressionWatch(snap).json.recent as Array<Record<string, unknown>>)
+      .find((r) => r.nightDate === "2026-09-13")!;
+  // 07:00 local ⇒ incomplete. A naive UTC-hour check (11 >= 9) would wrongly pass.
+  assertEquals(
+    findNight({ ...base, fetchedAt: "2026-09-14T11:00:00Z" }).excluded,
+    true,
+  );
+  // 11:00 local (15:00Z) ⇒ past the boundary ⇒ complete.
+  assertEquals(
+    findNight({ ...base, fetchedAt: "2026-09-14T15:00:00Z" }).excluded,
+    false,
+  );
+});
+
+Deno.test("regressionWatch ignores sessions with missing/zero duration", () => {
+  const snap: EntriesSnapshot = {
+    ...empty,
+    fetchedAt: "2026-09-14T18:00:00Z",
+    sinceHours: 720,
+    sleep: [
+      {
+        start: "2026-09-13T23:00:00Z",
+        end: "2026-09-14T04:00:00Z",
+        duration: "5:00:00",
+      },
+      { end: "2026-09-14T06:00:00Z" }, // no duration ⇒ must not count as a wake
+    ],
+  };
+  const night = (regressionWatch(snap).json.recent as Array<
+    Record<string, unknown>
+  >).find((r) => r.nightDate === "2026-09-13")!;
+  assertEquals(night.wakes, 0);
+  assertEquals(night.longestStretchH, 5);
+});
+
+const healthyRecent = [
+  { k: 6, longestH: 3.5, wakes: 2 },
+  { k: 5, longestH: 3.5, wakes: 2 },
+  { k: 4, longestH: 3.5, wakes: 2 },
+  { k: 3, longestH: 3.5, wakes: 2 },
+  { k: 2, longestH: 3.5, wakes: 2 },
+  { k: 1, longestH: 3.5, wakes: 2 },
+  { k: 0, longestH: 3.5, wakes: 2 },
+];
+
+Deno.test("regressionWatch treats truncation as advisory, not a verdict-suppressor", () => {
+  // Sleep is fresh & healthy; some OTHER record type hit the cap (global
+  // truncated=true). The sleep verdict must still stand, with an advisory note.
+  const snap = { ...watchSnapshot(healthyRecent), truncated: true };
+  const j = regressionWatch(snap).json;
+  assertEquals(j.status, "normal");
+  assertEquals(j.truncated, true);
+  assertStringIncludes(j.note as string, "truncated");
+});
+
+Deno.test("regressionWatch refuses a verdict when recent sleep is stale", () => {
+  // The sync happened weeks after the latest sleep night ⇒ recent sleep missing.
+  const snap = {
+    ...watchSnapshot(healthyRecent),
+    fetchedAt: "2026-10-05T12:00:00Z",
+  };
+  const j = regressionWatch(snap).json;
+  assertEquals(j.status, "insufficient_data");
+  assertStringIncludes(j.note as string, "behind the sync");
+});
+
+Deno.test("regressionWatch baseline defaults to a 28-night trailing window (baselineDays=0 spans)", () => {
+  // 40 baseline nights available (k=7..46) plus 7 recent nights.
+  const sleep: Array<Record<string, unknown>> = [];
+  for (let k = 7; k <= 46; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 3.5, 2));
+  }
+  for (let k = 0; k <= 6; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 3.5, 2));
+  }
+  const snap: EntriesSnapshot = {
+    ...empty,
+    fetchedAt: "2026-09-14T12:00:00Z",
+    sinceHours: 2160,
+    sleep,
+  };
+  // Default: trailing 28-night window (latest-34 .. latest-7).
+  const def = regressionWatch(snap).json.baseline as { nights: number };
+  assertEquals(def.nights, 28);
+  // baselineDays=0: span every available night before the recent window.
+  const spanned = regressionWatch(snap, { baselineDays: 0 }).json.baseline as {
+    nights: number;
+  };
+  assertEquals(spanned.nights, 40);
+  // baselineDays=21: fixed trailing 21-night window.
+  const capped = regressionWatch(snap, { baselineDays: 21 }).json.baseline as {
+    nights: number;
+  };
+  assertEquals(capped.nights, 21);
+});
+
+Deno.test("regressionWatch classifies a wake as fed when a feeding falls in the gap", () => {
+  const snap: EntriesSnapshot = {
+    ...empty,
+    fetchedAt: "2026-09-14T18:00:00Z",
+    sinceHours: 720,
+    sleep: [
+      {
+        start: "2026-09-14T00:00:00Z",
+        end: "2026-09-14T02:00:00Z",
+        duration: "2:00:00",
+      },
+      {
+        start: "2026-09-14T03:00:00Z",
+        end: "2026-09-14T04:00:00Z",
+        duration: "1:00:00",
+      }, // gap1 = 02:00–03:00
+      {
+        start: "2026-09-14T05:00:00Z",
+        end: "2026-09-14T06:00:00Z",
+        duration: "1:00:00",
+      }, // gap2 = 04:00–05:00
+    ],
+    feedings: [{ start: "2026-09-14T02:30:00Z" }], // falls in gap1 ⇒ fed wake
+  };
+  const night = (regressionWatch(snap).json.recent as Array<
+    Record<string, unknown>
+  >).find((r) => r.nightDate === "2026-09-13")!;
+  assertEquals(night.wakes, 2);
+  assertEquals(night.fedWakes, 1);
+  assertEquals(night.spontaneousWakes, 1);
+});
+
+Deno.test("safetyNotes: always includes a disclaimer + safe-sleep, flags missing weight", () => {
+  const s = safetyNotes(empty);
+  assertStringIncludes(s.disclaimer, "not a substitute for pediatric");
+  assertEquals(s.safeSleep.length > 0, true);
+  assertEquals(s.redFlags.some((f) => /No weight logged/.test(f)), true);
+});
+
+Deno.test("safetyNotes: flags a sustained weight decline (>=3 readings, beyond noise)", () => {
+  const s = safetyNotes({
+    ...empty,
+    weight: [
+      { date: "2026-08-01", weight: 6.0 },
+      { date: "2026-08-15", weight: 5.95 },
+      { date: "2026-09-01", weight: 5.8 },
+    ],
+  });
+  assertEquals(s.redFlags.some((f) => /lower at the end/.test(f)), true);
+});
+
+Deno.test("safetyNotes: two noisy weight readings do NOT trigger a flag", () => {
+  const s = safetyNotes({
+    ...empty,
+    weight: [
+      { date: "2026-08-01", weight: 6.0 },
+      { date: "2026-09-01", weight: 5.9 },
+    ],
+  });
+  assertEquals(s.redFlags.some((f) => /lower at the end/.test(f)), false);
+});
+
+Deno.test("regressionWatch staleness uses the exact gap, not floored days", () => {
+  // Latest night 2026-09-13 ⇒ morning boundary 2026-09-14T09:00Z.
+  // 2.5 days past it ⇒ stale (a floored '>2 days' check would miss this).
+  const stale = {
+    ...watchSnapshot(healthyRecent),
+    fetchedAt: "2026-09-16T21:00:00Z",
+  };
+  assertEquals(regressionWatch(stale).json.status, "insufficient_data");
+  // 1.5 days past ⇒ still fresh enough for a verdict.
+  const fresh = {
+    ...watchSnapshot(healthyRecent),
+    fetchedAt: "2026-09-15T21:00:00Z",
+  };
+  assertEquals(regressionWatch(fresh).json.status, "normal");
 });

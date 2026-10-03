@@ -30,7 +30,7 @@ Store the token in a vault, then create a model instance that references it:
 swamp vault store bb-secrets BABYBUDDY_TOKEN "<your-token>"
 
 # Create the tracker, wiring the token from the vault
-swamp model create @kneel/babybuddy connor \
+swamp model create @kneel/babybuddy baby \
   --global-arg baseUrl=https://baby.example.com \
   --global-arg 'token=${{ vault.get("bb-secrets", "BABYBUDDY_TOKEN") }}'
 ```
@@ -41,21 +41,21 @@ If `childId` is omitted, the first child on the instance is used.
 
 ```sh
 # Pull the last 7 days of activity into the `entries` data snapshot
-swamp model method run connor sync --input sinceHours=168
+swamp model method run baby sync --input sinceHours=168
 
 # Log a bottle feeding of 90ml over the last 15 minutes
-swamp model method run connor log-feeding \
+swamp model method run baby log-feeding \
   --input method=bottle --input type=formula \
   --input amount=90 --input durationMinutes=15
 
 # View the consolidated daily summary produced after sync
-swamp report get @kneel/babybuddy-daily-summary --model connor --markdown
+swamp report get @kneel/babybuddy-daily-summary --model baby --markdown
 
 # Timers: start one, then close it into its activity when you're done.
 # A named timer auto-converts; stop-timer never silently discards.
-swamp model method run connor start-timer --input name=sleep
-swamp model method run connor stop-timer            # infers "sleep", creates the sleep entry
-swamp model method run connor stop-timer --input createEntry=discard   # explicit throw-away
+swamp model method run baby start-timer --input name=sleep
+swamp model method run baby stop-timer            # infers "sleep", creates the sleep entry
+swamp model method run baby stop-timer --input createEntry=discard   # explicit throw-away
 ```
 
 ## Methods
@@ -78,6 +78,8 @@ Every `sync` produces all of these (read any with
 - `daily-summary` — consolidated per-day digest
 - `sleep-totals` — daily sleep with nap vs night split
 - `sleep-longest-stretch` — longest/average consecutive block per day
+- `sleep-regression-watch` — sustained sleep-regression detector (vs. nap
+  fragmentation) with an early-warning watch tier and a non-diagnostic safety layer
 - `sleep-feeding-correlation` — sleep hours vs feeding count/volume
 - `feeding-amounts` — daily counts and volume (breast vs bottle)
 - `feeding-duration` — average and total feeding duration per day

@@ -11,6 +11,7 @@
  */
 import {
   aggregateByDate,
+  dateFromIso,
   type EntriesSnapshot,
   parseDurationHours,
   parseEntriesSnapshot,
@@ -476,6 +477,595 @@ export function sleepTotals(e: EntriesSnapshot): ReportResult {
     )
   }`;
   return { markdown: md, json: { title, days, rows } };
+}
+
+// ---------------------------------------------------------------------------
+// Sleep regression watch
+// ---------------------------------------------------------------------------
+
+const NIGHT_START_HOUR = 21; // 21:00 — a session ending at/after this counts as night
+// 09:00 (exclusive). The nominal night window is 21:00–08:00, but the morning
+// wake-up boundary is stretched an hour so a healthy overnight block that ends
+// at, say, 08:15 still counts as night sleep instead of being silently dropped.
+const NIGHT_END_HOUR = 9;
+const MIN_NIGHT_TOTAL_H = 4; // below this, a night is treated as sparse/partial
+const BASELINE_GAP_DAYS = 7; // baseline ends this many nights before the latest
+const BASELINE_DAYS_DEFAULT = 28; // default trailing baseline length (tracks the child's stage)
+const RECENT_DAYS = 7; // recent window length, in nights
+const MIN_BASELINE_NIGHTS = 10; // need a real distribution before we alarm
+const SUSTAIN_NIGHTS = 3; // a signal must persist this many nights
+const SIGMA_K = 1.5; // alarm at μ ± this many σ
+const SIGMA_WATCH = 1.0; // softer band for the early-warning "watch" tier
+const WATCH_MIN_NIGHTS = 2; // this many soft breaches (any metric) ⇒ watch
+const ABSOLUTE_TRIGGER_H = 2 + 40 / 60; // 2h40m advisory floor (from handoff)
+const MAX_STALE_DAYS = 2; // if the latest night trails the sync by more, refuse a verdict
+
+/** Wall-clock hour (0–23) parsed naively from an ISO datetime prefix. */
+function hourFromIso(iso: unknown): number | null {
+  if (typeof iso !== "string" || iso.length < 13) return null;
+  const h = Number(iso.slice(11, 13));
+  return Number.isInteger(h) && h >= 0 && h <= 23 ? h : null;
+}
+
+/** Add `delta` days to a YYYY-MM-DD date string (UTC-safe). */
+function addDays(date: string, delta: number): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Timezone designator at the end of an ISO datetime ("Z" or "±HH:MM"), so a
+ * boundary instant can be built in the same frame as the source timestamp.
+ * Defaults to "Z" for offset-less (naive) strings.
+ */
+function tzOffsetOf(iso: string): string {
+  const m = iso.match(/(Z|[+-]\d{2}:?\d{2})$/);
+  return m ? m[1] : "Z";
+}
+
+function mean(xs: number[]): number {
+  return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
+}
+
+/** Population standard deviation about `mu`. */
+function popStd(xs: number[], mu: number): number {
+  if (!xs.length) return 0;
+  return Math.sqrt(mean(xs.map((x) => (x - mu) ** 2)));
+}
+
+/** Least-squares slope of `ys` against its index (per step); 0 if <2 points. */
+function olsSlope(ys: number[]): number {
+  const n = ys.length;
+  if (n < 2) return 0;
+  const xm = (n - 1) / 2;
+  const ym = mean(ys);
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (i - xm) * (ys[i] - ym);
+    den += (i - xm) ** 2;
+  }
+  return den === 0 ? 0 : num / den;
+}
+
+/** Longest run of consecutive list entries (by position) satisfying `pred`. */
+function maxRun<T>(items: T[], pred: (x: T) => boolean): number {
+  let best = 0;
+  let cur = 0;
+  for (const it of items) {
+    if (pred(it)) {
+      cur += 1;
+      if (cur > best) best = cur;
+    } else {
+      cur = 0;
+    }
+  }
+  return best;
+}
+
+/** One night's derived sleep metrics. */
+interface NightRow {
+  nightDate: string;
+  longestStretchH: number;
+  wakes: number; // total intra-night awakenings
+  fedWakes: number; // awakenings with a feed in the gap
+  spontaneousWakes: number; // wakes − fedWakes (the regression-relevant axis)
+  nightTotalH: number;
+  excluded: boolean;
+  stretchLow: boolean;
+  wakesHigh: boolean;
+}
+
+/**
+ * Detect a sustained sleep regression vs. benign daytime nap fragmentation.
+ *
+ * Groups sleep sessions *ending* in the night window (21:00–09:00, the extra
+ * morning hour catching real wake-ups) into nights, derives each night's longest
+ * stretch and intra-night wake count, then compares the last {@link RECENT_DAYS}
+ * nights against a baseline that ends {@link BASELINE_GAP_DAYS} nights ago. By
+ * default the baseline is a trailing {@link BASELINE_DAYS_DEFAULT}-night window
+ * (so it tracks the child's current stage, not blended newborn history); pass
+ * `baselineDays: 0` to span the whole synced window, or a positive N for a fixed
+ * length. The wake axis is *spontaneous* wakes — awakenings without a feed in the
+ * gap — since normal night feeds shouldn't read as regression. It also appends a
+ * non-diagnostic safety layer (see {@link safetyNotes}). A regression is flagged
+ * only when BOTH the longest stretch craters
+ * (< μ − 1.5σ) AND wakes spike (> μ + 1.5σ) for ≥3 consecutive nights; a single
+ * condition alone is labelled `nap_fragmentation`. Short of those, ≥{@link
+ * WATCH_MIN_NIGHTS} recent nights breaching a softer μ±1σ band raise an
+ * early-warning `watch`. Also reports the recent longest-stretch trend
+ * (min/week) as a leading indicator. Detects; only the trend hints ahead.
+ *
+ * Assumes Baby Buddy timestamps are in the child's local timezone (the same
+ * naive-local convention {@link aggregateByDate} uses). Needs ≥{@link
+ * MIN_BASELINE_NIGHTS} complete baseline nights — sync a wide enough window
+ * (`sinceHours`) or it returns `insufficient_data`. It also refuses a verdict
+ * when its latest night trails `fetchedAt` by more than {@link MAX_STALE_DAYS},
+ * rather than calling stale data "normal".
+ */
+export function regressionWatch(
+  e: EntriesSnapshot,
+  opts: { baselineDays?: number } = {},
+): ReportResult {
+  const title = "Sleep Regression Watch";
+  const days = daysOf(e);
+
+  // Feeding start instants (sorted) — used to tell a fed waking from a
+  // spontaneous arousal. A gap counts as fed iff a feed falls strictly inside the
+  // awake window between two sleep sessions (gaps are disjoint, so a single feed
+  // can't be credited to two wakes, and a feed logged during a sleep session
+  // isn't in any gap).
+  const feedMs = e.feedings
+    .map((f) => (typeof f.start === "string" ? Date.parse(f.start) : NaN))
+    .filter((x) => !Number.isNaN(x))
+    .sort((a, b) => a - b);
+  const fedInGap = (gapStart: number, gapEnd: number): boolean =>
+    gapEnd > gapStart && feedMs.some((t) => t >= gapStart && t <= gapEnd);
+
+  // Bucket night-window sessions by attributed night date. Each bucket keeps the
+  // source timezone offset so night boundaries stay in the child's local frame,
+  // and per-session start/end so awakenings (gaps) can be classified. startMs may
+  // be NaN (missing/bad start) — the session still counts toward longest/total,
+  // it just can't anchor a gap.
+  interface Sess {
+    startMs: number;
+    endMs: number;
+    durH: number;
+  }
+  const byNight: Record<string, { sessions: Sess[]; offset: string }> = {};
+  for (const s of e.sleep) {
+    if (typeof s.end !== "string") continue;
+    const endHour = hourFromIso(s.end);
+    if (endHour === null) continue;
+    const inWindow = endHour >= NIGHT_START_HOUR || endHour < NIGHT_END_HOUR;
+    if (!inWindow) continue;
+    const endDate = dateFromIso(s.end);
+    if (!endDate) continue;
+    const durH = parseDurationHours(s.duration);
+    if (!(durH > 0)) continue; // skip missing/malformed durations
+    const endMs = Date.parse(s.end);
+    if (Number.isNaN(endMs)) continue;
+    const startMs = typeof s.start === "string" ? Date.parse(s.start) : NaN;
+    // A block ending after midnight belongs to the previous evening's night.
+    const nightDate = endHour >= NIGHT_START_HOUR
+      ? endDate
+      : addDays(endDate, -1);
+    const bucket = (byNight[nightDate] ??= {
+      sessions: [],
+      offset: tzOffsetOf(s.end),
+    });
+    bucket.sessions.push({ startMs, endMs, durH });
+  }
+
+  const nightDates = Object.keys(byNight).sort();
+  if (!nightDates.length) {
+    return empty(
+      title,
+      days,
+      "No night-time sleep sessions with end times found.",
+    );
+  }
+
+  const latest = nightDates[nightDates.length - 1];
+  const fetchedMs = Date.parse(e.fetchedAt);
+
+  // Instant of a night's morning boundary, built in that night's own tz frame.
+  const morningMsOf = (night: string): number => {
+    const hh = String(NIGHT_END_HOUR).padStart(2, "0");
+    return Date.parse(
+      `${addDays(night, 1)}T${hh}:00:00${byNight[night].offset}`,
+    );
+  };
+
+  // A night is complete once the wall clock is past its morning boundary.
+  // Compared as instants so a UTC `fetchedAt` and a locally-offset sleep
+  // timestamp don't disagree.
+  const isComplete = (night: string): boolean => {
+    if (Number.isNaN(fetchedMs)) return true; // no clock to judge by
+    const morningMs = morningMsOf(night);
+    return Number.isNaN(morningMs) ? true : fetchedMs >= morningMs;
+  };
+
+  // How far the latest *sleep* night trails the sync. A large gap means recent
+  // nights are missing (e.g. truncation dropped them). This is sleep-specific —
+  // unlike e.truncated, which is a global OR across every record type — so it
+  // doesn't misfire when some unrelated endpoint (e.g. diapers) hit the cap.
+  const DAY_MS = 86_400_000;
+  const latestMorningMs = morningMsOf(latest);
+  const staleMs = Number.isNaN(fetchedMs) || Number.isNaN(latestMorningMs)
+    ? 0
+    : Math.max(0, fetchedMs - latestMorningMs);
+  const staleDays = Math.floor(staleMs / DAY_MS); // for display/JSON
+  const isStale = staleMs > MAX_STALE_DAYS * DAY_MS; // exact gap, not floored
+
+  const rows: NightRow[] = nightDates.map((nightDate) => {
+    const all = byNight[nightDate].sessions;
+    // longest/total use every valid session (even one with a bad start).
+    const durs = all.map((s) => s.durH);
+    const nightTotalH = round2(durs.reduce((a, b) => a + b, 0));
+    const wakes = Math.max(0, all.length - 1);
+    // Gaps (awakenings) can only be anchored by sessions with a valid start.
+    const timed = all.filter((s) => !Number.isNaN(s.startMs)).sort((a, b) =>
+      a.startMs - b.startMs
+    );
+    let fedWakes = 0;
+    for (let i = 0; i < timed.length - 1; i++) {
+      if (fedInGap(timed[i].endMs, timed[i + 1].startMs)) fedWakes++;
+    }
+    return {
+      nightDate,
+      longestStretchH: round2(Math.max(...durs)),
+      wakes,
+      fedWakes,
+      spontaneousWakes: Math.max(0, wakes - fedWakes),
+      nightTotalH,
+      excluded: nightTotalH < MIN_NIGHT_TOTAL_H || !isComplete(nightDate),
+      stretchLow: false,
+      wakesHigh: false,
+    };
+  });
+
+  // Baseline ends BASELINE_GAP_DAYS before the latest night. Default is a
+  // trailing BASELINE_DAYS_DEFAULT-night window (tracks the child's current
+  // developmental stage rather than blending in newborn history); baselineDays=0
+  // opts into spanning the whole synced window; baselineDays=N sets a fixed length.
+  // Clamp: undefined ⇒ default; negatives are nonsense ⇒ treat as 0 (span-all)
+  // rather than silently inverting the window.
+  const baselineDays = opts.baselineDays === undefined
+    ? BASELINE_DAYS_DEFAULT
+    : Math.max(0, opts.baselineDays);
+  const baselineHi = addDays(latest, -BASELINE_GAP_DAYS);
+  const baselineLo = baselineDays === 0
+    ? nightDates[0]
+    : addDays(latest, -(BASELINE_GAP_DAYS + baselineDays - 1));
+  const recentLo = addDays(latest, -(RECENT_DAYS - 1));
+
+  const baseline = rows.filter((r) =>
+    !r.excluded && r.nightDate >= baselineLo && r.nightDate <= baselineHi
+  );
+  const recent = rows.filter((r) => r.nightDate >= recentLo); // incl. excluded
+
+  // The wake axis is SPONTANEOUS wakes (fed wakings are normal for a breastfed
+  // infant and shouldn't count toward a regression signal).
+  const rawMuStretch = mean(baseline.map((r) => r.longestStretchH));
+  const rawMuWakes = mean(baseline.map((r) => r.spontaneousWakes));
+  const rawSigmaStretch = popStd(
+    baseline.map((r) => r.longestStretchH),
+    rawMuStretch,
+  );
+  const rawSigmaWakes = popStd(
+    baseline.map((r) => r.spontaneousWakes),
+    rawMuWakes,
+  );
+
+  // Compare against raw (unrounded) thresholds to avoid compounding rounding at a
+  // boundary; a longest stretch can't be negative, so clamp its floor at 0.
+  const stretchLowH = Math.max(0, rawMuStretch - SIGMA_K * rawSigmaStretch);
+  const wakesHighCount = rawMuWakes + SIGMA_K * rawSigmaWakes;
+
+  const muStretch = round2(rawMuStretch);
+  const sigmaStretch = round2(rawSigmaStretch);
+  const muWakes = round2(rawMuWakes);
+  const sigmaWakes = round2(rawSigmaWakes);
+  const stretchLowHR = round2(stretchLowH); // rounded, for display only
+  const wakesHighCountR = round2(wakesHighCount);
+
+  for (const r of recent) {
+    if (r.excluded) continue;
+    r.stretchLow = r.longestStretchH < stretchLowH;
+    r.wakesHigh = r.spontaneousWakes > wakesHighCount;
+  }
+
+  const recentActive = recent.filter((r) => !r.excluded);
+  const sevenDayMeanStretchH = recentActive.length
+    ? round2(mean(recentActive.map((r) => r.longestStretchH)))
+    : null;
+  const absoluteTriggerHit = sevenDayMeanStretchH !== null &&
+    sevenDayMeanStretchH < ABSOLUTE_TRIGGER_H;
+
+  // Early-warning ("watch") signals: recent nights breaching a softer μ±1σ band,
+  // plus the recent longest-stretch trend (leading edge of a regression).
+  const softStretchLowH = Math.max(
+    0,
+    rawMuStretch - SIGMA_WATCH * rawSigmaStretch,
+  );
+  const softWakesHighCount = rawMuWakes + SIGMA_WATCH * rawSigmaWakes;
+  const watchNights =
+    recentActive.filter((r) =>
+      r.longestStretchH < softStretchLowH ||
+      r.spontaneousWakes > softWakesHighCount
+    ).length;
+  // Slope of recent longest stretch, in minutes/week (recentActive is date-asc).
+  const stretchTrendMinPerWeek = round1(
+    olsSlope(recentActive.map((r) => r.longestStretchH)) * 60 * 7,
+  );
+  // Raised watch bar: only fire on a real leading edge — several soft breaches,
+  // or a couple paired with an actually-declining trend. The trend arm needs a
+  // meaningful sample (≥5 active nights) so a 2-point "slope" can't cry wolf.
+  const watchTriggered = watchNights >= 3 ||
+    (watchNights >= WATCH_MIN_NIGHTS && recentActive.length >= 5 &&
+      stretchTrendMinPerWeek < 0);
+
+  const bothRun = maxRun(recentActive, (r) => r.stretchLow && r.wakesHigh);
+  const stretchOnlyRun = maxRun(
+    recentActive,
+    (r) => r.stretchLow && !r.wakesHigh,
+  );
+  const wakesOnlyRun = maxRun(
+    recentActive,
+    (r) => r.wakesHigh && !r.stretchLow,
+  );
+
+  let status: string;
+  let note: string;
+  if (isStale) {
+    // Recent sleep nights are missing — refuse a verdict rather than call stale
+    // data "normal". (Keyed off sleep recency, not the global truncated flag.)
+    status = "insufficient_data";
+    note =
+      `⚠️ No verdict emitted — the latest analyzed night (${latest}) is ${staleDays} days behind the sync, so recent sleep is missing. Re-sync a smaller window (e.g. sinceHours=720) so recent nights are present.`;
+  } else if (
+    baseline.length < MIN_BASELINE_NIGHTS || recentActive.length === 0
+  ) {
+    status = "insufficient_data";
+    note =
+      `Need ≥${MIN_BASELINE_NIGHTS} complete baseline nights (have ${baseline.length}) and ≥1 recent night (have ${recentActive.length}). Re-run sync with sinceHours ≥ 720 (30d) for enough history.`;
+  } else if (bothRun >= SUSTAIN_NIGHTS) {
+    status = "regression";
+    note = `Longest stretch < ${
+      fmtHM(stretchLowHR)
+    } AND wakes > ${wakesHighCountR} for ${bothRun} consecutive nights.`;
+  } else if (
+    stretchOnlyRun >= SUSTAIN_NIGHTS || wakesOnlyRun >= SUSTAIN_NIGHTS
+  ) {
+    status = "nap_fragmentation";
+    note = stretchOnlyRun >= SUSTAIN_NIGHTS
+      ? `Longest stretch low but wakes normal for ${stretchOnlyRun} nights — fragmentation, not regression.`
+      : `Wakes elevated but longest stretch holding for ${wakesOnlyRun} nights — fragmentation, not regression.`;
+  } else if (watchTriggered) {
+    status = "watch";
+    const trend = stretchTrendMinPerWeek < 0
+      ? ` Longest-stretch trend ${stretchTrendMinPerWeek} min/wk (declining).`
+      : "";
+    note =
+      `Early warning: ${watchNights} of the last ${recentActive.length} nights breached the soft μ±1σ band (spontaneous wakes).${trend} Not a regression yet — worth keeping an eye out.`;
+  } else {
+    status = "normal";
+    note =
+      "No sustained (≥3-night) drop in longest stretch combined with elevated wakes.";
+  }
+
+  // Truncation is advisory only — it doesn't suppress a verdict (the sleep data
+  // may be complete even if some other record type hit the cap), but flag it so
+  // a capped snapshot isn't read as fully authoritative.
+  if (e.truncated) {
+    note +=
+      " ⚠️ Note: the snapshot is truncated (some record type hit Baby Buddy's page cap).";
+  }
+
+  const safety = safetyNotes(e);
+  const json = {
+    title,
+    status,
+    note,
+    truncated: e.truncated,
+    latestNight: latest,
+    staleDays,
+    baselineDays,
+    baseline: {
+      nights: baseline.length,
+      muStretchH: muStretch,
+      sigmaStretchH: sigmaStretch,
+      muWakes, // spontaneous wakes
+      sigmaWakes,
+    },
+    thresholds: {
+      stretchLowH: stretchLowHR,
+      wakesHighCount: wakesHighCountR, // on spontaneous wakes
+      absoluteTriggerH: round2(ABSOLUTE_TRIGGER_H),
+    },
+    sevenDayMeanStretchH,
+    absoluteTriggerHit,
+    stretchTrendMinPerWeek,
+    watchNights,
+    recent: recent.map((r) => ({
+      nightDate: r.nightDate,
+      longestStretchH: r.longestStretchH,
+      wakes: r.wakes,
+      fedWakes: r.fedWakes,
+      spontaneousWakes: r.spontaneousWakes,
+      nightTotalH: r.nightTotalH,
+      stretchLow: r.stretchLow,
+      wakesHigh: r.wakesHigh,
+      excluded: r.excluded,
+    })),
+    safety,
+  };
+
+  const statusLabel: Record<string, string> = {
+    regression: "🔴 REGRESSION",
+    nap_fragmentation: "🟠 nap fragmentation",
+    watch: "🟡 watch (early warning)",
+    normal: "🟢 normal",
+    insufficient_data: "⚪ insufficient data",
+  };
+  const lines = [
+    header(title, days),
+    "",
+    `**Status: ${statusLabel[status] ?? status}** — ${note}`,
+    "",
+    `Baseline (${baseline.length} nights, trailing): longest stretch μ=${
+      fmtHM(muStretch)
+    } σ=${fmtHM(sigmaStretch)}; spont. wakes μ=${muWakes} σ=${sigmaWakes}.`,
+    `Alarm thresholds: longest < ${
+      fmtHM(stretchLowHR)
+    }, spont. wakes > ${wakesHighCountR}.`,
+    `7-night mean longest stretch: ${
+      sevenDayMeanStretchH === null ? "—" : fmtHM(sevenDayMeanStretchH)
+    } (absolute trigger ${fmtHM(round2(ABSOLUTE_TRIGGER_H))}${
+      absoluteTriggerHit ? " — HIT" : ""
+    }).`,
+    `Longest-stretch trend (recent): ${
+      stretchTrendMinPerWeek >= 0 ? "+" : ""
+    }${stretchTrendMinPerWeek} min/week ${
+      stretchTrendMinPerWeek > 0
+        ? "↑ improving"
+        : stretchTrendMinPerWeek < 0
+        ? "↓ declining"
+        : "→ flat"
+    }; ${watchNights} recent night(s) breaching the soft μ±1σ band.`,
+    "",
+    table(
+      ["Night", "Longest", "Wakes (spont+fed)", "Night total", "Flags"],
+      recent.map((r) => [
+        r.nightDate,
+        fmtHM(r.longestStretchH),
+        `${r.spontaneousWakes} (+${r.fedWakes})`,
+        fmtHM(r.nightTotalH),
+        r.excluded ? "excluded" : ([
+          r.stretchLow ? "stretch↓" : "",
+          r.wakesHigh ? "wakes↑" : "",
+        ].filter(Boolean).join(" ") || "—"),
+      ]),
+    ),
+    "",
+    "### Safety",
+    `_${safety.disclaimer}_`,
+    "",
+    ...(safety.redFlags.length
+      ? [
+        "**Red flags to raise with your pediatrician:**",
+        ...safety.redFlags.map(
+          (f) => `- ⚠️ ${f}`,
+        ),
+        "",
+      ]
+      : ["_No data-derived red flags in the logged window._", ""]),
+    "Safe sleep (AAP):",
+    ...safety.safeSleep.map((s) => `- ${s}`),
+  ];
+
+  return { markdown: lines.join("\n"), json };
+}
+
+/**
+ * Non-diagnostic safety layer for the sleep report: an AAP safe-sleep reminder,
+ * heuristic red flags derived from the weight/feeding/diaper data Baby Buddy
+ * already holds, and a disclaimer. These are coarse prompts to raise with a
+ * pediatrician — NOT clinical assessments.
+ */
+export function safetyNotes(
+  e: EntriesSnapshot,
+): { disclaimer: string; safeSleep: string[]; redFlags: string[] } {
+  const redFlags: string[] = [];
+  const DAY = 86_400_000;
+  const fetchedMs = Date.parse(e.fetchedAt);
+
+  // Weight: only hint at a problem with ≥3 readings AND a net decline beyond
+  // home-scale noise — two noisy readings shouldn't manufacture a growth scare.
+  const WEIGHT_TOL_KG = 0.1;
+  const weights = e.weight
+    .map((w) => ({ date: String(w.date ?? ""), kg: Number(w.weight ?? NaN) }))
+    .filter((w) => w.date && !Number.isNaN(w.kg))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  if (weights.length === 0) {
+    redFlags.push("No weight logged — growth can't be checked from this data.");
+  } else if (
+    weights.length >= 3 &&
+    weights[weights.length - 1].kg < weights[0].kg - WEIGHT_TOL_KG
+  ) {
+    redFlags.push(
+      `Logged weight is lower at the end of the window than the start (${
+        weights[0].kg
+      }→${
+        weights[weights.length - 1].kg
+      } kg over ${weights.length} readings) — ` +
+        "worth asking your pediatrician about growth (home-scale readings are noisy).",
+    );
+  }
+
+  // Recent feeding/diaper rate — divide by the days actually observed, and only
+  // judge once ~a week of data exists (so brand-new users aren't false-alarmed).
+  const eventMs = [
+    ...e.feedings.map((f) => f.start),
+    ...e.changes.map((c) => c.time),
+  ]
+    .map((x) => (typeof x === "string" ? Date.parse(x) : NaN))
+    .filter((x) => !Number.isNaN(x));
+  const firstMs = eventMs.length ? Math.min(...eventMs) : NaN;
+  const weekAgo = Number.isNaN(fetchedMs) ? NaN : fetchedMs - 7 * DAY;
+  const observedDays = Number.isNaN(fetchedMs) || Number.isNaN(firstMs)
+    ? 0
+    : Math.min(
+      7,
+      Math.max(1, Math.round((fetchedMs - Math.max(firstMs, weekAgo)) / DAY)),
+    );
+  const inLastWeek = (iso: unknown): boolean => {
+    if (Number.isNaN(weekAgo) || typeof iso !== "string") return false;
+    const t = Date.parse(iso);
+    return !Number.isNaN(t) && t >= weekAgo;
+  };
+  if (observedDays >= 6) {
+    const feedsWk = e.feedings.filter((f) => inLastWeek(f.start)).length;
+    if (feedsWk === 0) {
+      redFlags.push(
+        "No feeds logged in the last week — if that's a logging gap it's fine, otherwise check feeding.",
+      );
+    } else if (feedsWk / observedDays < 6) {
+      redFlags.push(
+        `Only ~${
+          Math.round(feedsWk / observedDays)
+        } feeds/day logged recently (breastfed infants often 8–12/day) — worth checking feeding is adequate.`,
+      );
+    }
+    const wetWk = e.changes.filter((c) => c.wet === true && inLastWeek(c.time))
+      .length;
+    if (wetWk === 0) {
+      redFlags.push(
+        "No wet diapers logged in the last week — if that's a logging gap it's fine, otherwise watch hydration.",
+      );
+    } else if (wetWk / observedDays < 5) {
+      redFlags.push(
+        `Only ~${
+          Math.round(wetWk / observedDays)
+        } wet diapers/day logged recently (≥6 is typical) — worth watching hydration.`,
+      );
+    }
+  }
+
+  return {
+    disclaimer:
+      "This flags patterns in logged data only. It does not assess growth, feeding adequacy, breathing (snoring/pauses/apnea), reflux, or the sleep environment, and is not a substitute for pediatric evaluation. Ask your pediatrician about snoring or breathing pauses, reflux, and weight gain.",
+    safeSleep: [
+      "Back to sleep, every sleep.",
+      "Firm, flat, separate surface (crib/bassinet) — room-share, don't bed-share.",
+      "Nothing soft in the sleep space: no pillows, blankets, bumpers, or toys.",
+      "Stop swaddling once they show signs of rolling (~4 months).",
+      "Avoid overheating; keep the room comfortable.",
+    ],
+    redFlags,
+  };
 }
 
 /** Daily pumping totals, session counts, and averages. */

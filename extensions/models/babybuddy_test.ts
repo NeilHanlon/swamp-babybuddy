@@ -1,14 +1,119 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
 import { z } from "npm:zod@4";
 import {
   aggregateByDate,
   backdatePatch,
   buildDailySummary,
   dateFromIso,
+  dedupeById,
   inferTimerKind,
   jsonish,
+  paginate,
   parseDurationHours,
+  withRetry,
 } from "./babybuddy.ts";
+
+/** Build a fake pager over `total` records that serves fixed-size pages. */
+function fakePager(total: number) {
+  const all = Array.from({ length: total }, (_, i) => ({ id: i }));
+  let calls = 0;
+  const fetchPage = (offset: number, limit: number) => {
+    calls++;
+    const results = all.slice(offset, offset + limit);
+    return Promise.resolve({
+      results,
+      hasNext: offset + results.length < total,
+    });
+  };
+  return { fetchPage, calls: () => calls };
+}
+
+Deno.test("paginate: single full page with no successor ⇒ one call, not truncated", async () => {
+  const p = fakePager(300);
+  const r = await paginate(p.fetchPage, { pageSize: 500 });
+  assertEquals(r.results.length, 300);
+  assertEquals(r.truncated, false);
+  assertEquals(p.calls(), 1);
+});
+
+Deno.test("paginate: drains multiple pages and concatenates them", async () => {
+  const p = fakePager(1250);
+  const r = await paginate(p.fetchPage, { pageSize: 500 });
+  assertEquals(r.results.length, 1250);
+  assertEquals(r.truncated, false);
+  assertEquals(p.calls(), 3); // 500 + 500 + 250
+  assertEquals((r.results[0] as { id: number }).id, 0);
+  assertEquals((r.results[1249] as { id: number }).id, 1249);
+});
+
+Deno.test("paginate: caps at exactly maxRecords (trims overshoot) and reports truncated", async () => {
+  const p = fakePager(100_000);
+  const r = await paginate(p.fetchPage, { pageSize: 500, maxRecords: 1000 });
+  assertEquals(r.truncated, true);
+  assertEquals(r.results.length, 1000);
+});
+
+Deno.test("paginate: caps exactly even when maxRecords is not a multiple of pageSize", async () => {
+  const p = fakePager(100_000);
+  const r = await paginate(p.fetchPage, { pageSize: 500, maxRecords: 1200 });
+  assertEquals(r.truncated, true);
+  assertEquals(r.results.length, 1200);
+});
+
+Deno.test("dedupeById drops duplicate ids, keeps id-less rows and first occurrence", () => {
+  const out = dedupeById([
+    { id: 1, v: "a" },
+    { id: 2, v: "b" },
+    { id: 1, v: "dup" }, // duplicate from offset drift ⇒ dropped
+    { v: "no-id" }, // kept
+    { id: null, v: "null-id" }, // kept
+  ]);
+  assertEquals(out.map((r) => r.v), ["a", "b", "no-id", "null-id"]);
+});
+
+Deno.test("withRetry: succeeds after a transient failure", async () => {
+  let calls = 0;
+  const r = await withRetry(
+    () => {
+      calls++;
+      if (calls < 2) return Promise.reject(new Error("flaky"));
+      return Promise.resolve("ok");
+    },
+    3,
+    0,
+  );
+  assertEquals(r, "ok");
+  assertEquals(calls, 2);
+});
+
+Deno.test("withRetry: throws the last error after exhausting attempts", async () => {
+  let calls = 0;
+  await assertRejects(
+    () =>
+      withRetry(
+        () => {
+          calls++;
+          return Promise.reject(new Error("always"));
+        },
+        3,
+        0,
+      ),
+    Error,
+    "always",
+  );
+  assertEquals(calls, 3);
+});
+
+Deno.test("paginate: a zero-length page terminates the loop", async () => {
+  let calls = 0;
+  const r = await paginate((_o, _l) => {
+    calls++;
+    return Promise.resolve({ results: [], hasNext: true }); // lies about next
+  });
+  assertEquals(r.results.length, 0);
+  assertEquals(r.truncated, false);
+  assertEquals(calls, 1);
+});
 
 Deno.test("backdatePatch: no start/end -> null (no extra PATCH, backward compatible)", () => {
   assertEquals(backdatePatch({}), null);

@@ -44,7 +44,9 @@ const EntriesSchema = z.object({
   temperature: z.array(EntrySchema),
   medication: z.array(EntrySchema),
   weight: z.array(EntrySchema),
-  truncated: z.boolean(),
+  // Tolerant default: an "entries" snapshot persisted before this field existed
+  // still parses (reports read entries.truncated). sync always sets it explicitly.
+  truncated: z.boolean().default(false),
 });
 
 const LoggedSchema = z.object({
@@ -162,7 +164,7 @@ interface ListResult {
   truncated: boolean;
 }
 
-/** GET a list endpoint, returning the `results` page and a truncation flag. */
+/** GET a single list page, returning the `results` page and a truncation flag. */
 async function bbList(
   args: GlobalArgs,
   path: string,
@@ -173,6 +175,106 @@ async function bbList(
     results: (resp.results as Array<Record<string, unknown>>) ?? [],
     truncated: Boolean(resp.next),
   };
+}
+
+/** One page fetched by {@link paginate}: its records and whether more follow. */
+interface Page {
+  results: Array<Record<string, unknown>>;
+  hasNext: boolean;
+}
+
+/**
+ * Drain limit/offset pages from `fetchPage` into one list. Stops when a page
+ * reports no successor (fully drained ⇒ `truncated: false`) or once `maxRecords`
+ * is reached (real overflow ⇒ `truncated: true`, trimmed to exactly that many).
+ * Pure over `fetchPage`, so the paging logic is unit-testable without a network.
+ * A zero-length page always terminates the loop, so a misbehaving server can't
+ * spin it forever.
+ */
+export async function paginate(
+  fetchPage: (offset: number, limit: number) => Promise<Page>,
+  opts: { pageSize?: number; maxRecords?: number } = {},
+): Promise<ListResult> {
+  const pageSize = opts.pageSize ?? 500;
+  const maxRecords = opts.maxRecords ?? 20_000;
+  const results: Array<Record<string, unknown>> = [];
+  let offset = 0;
+  while (true) {
+    const page = await fetchPage(offset, pageSize);
+    results.push(...page.results);
+    if (!page.hasNext || page.results.length === 0) {
+      return { results, truncated: false };
+    }
+    if (results.length >= maxRecords) {
+      // Trim the overshoot so we honour the cap exactly (the fetches use
+      // descending order, so slice(0, n) keeps the most recent records).
+      return { results: results.slice(0, maxRecords), truncated: true };
+    }
+    offset += page.results.length;
+  }
+}
+
+/**
+ * Drop records with a duplicate `id`, keeping first occurrence. Offset
+ * pagination over a live table can re-serve or skip a row if an entry is
+ * logged/deleted between page fetches; dedup neutralises the duplicate case
+ * (which would otherwise inflate e.g. a night's wake count).
+ */
+export function dedupeById(
+  rows: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const seen = new Set<unknown>();
+  return rows.filter((r) => {
+    const id = r.id;
+    if (id === undefined || id === null) return true; // keep id-less rows
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+/** Retry an async op a few times with linear backoff (for flaky page GETs). */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  delayMs = 250,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1 && delayMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * GET all pages of a list endpoint (limit/offset), draining to completion.
+ * `query` should NOT include `limit`/`offset` — pagination controls those.
+ * Each page GET is retried so one transient blip doesn't discard a whole
+ * multi-page sync, and results are de-duplicated by id (see {@link dedupeById}).
+ */
+async function bbListAll(
+  args: GlobalArgs,
+  path: string,
+  query: QueryParams,
+  opts?: { pageSize?: number; maxRecords?: number },
+): Promise<ListResult> {
+  const drained = await paginate(async (offset, limit) => {
+    const resp = await withRetry(() =>
+      bbRequest(args, "GET", path, { query: { ...query, limit, offset } })
+    );
+    return {
+      results: (resp.results as Array<Record<string, unknown>>) ?? [],
+      hasNext: Boolean(resp.next),
+    };
+  }, opts);
+  return { results: dedupeById(drained.results), truncated: drained.truncated };
 }
 
 /** Resolve the child id, defaulting to the first child on the instance. */
@@ -675,8 +777,16 @@ const StopTimerArgs = z.object({
 /** Consolidated Baby Buddy tracker model type. */
 export const model = {
   type: "@kneel/babybuddy",
-  version: "2026.07.18.1",
+  version: "2026.10.03.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.10.03.1",
+      description:
+        "Paginated sync (drains the >500-record/type cap with dedup + retry) and a tolerant `truncated` default on the entries snapshot. No globalArguments schema change — config carries over unchanged.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     "entries": {
       description: "Snapshot of recent entries across all tracked types",
@@ -713,6 +823,7 @@ export const model = {
     "@kneel/babybuddy-daily-summary",
     "@kneel/babybuddy-sleep-feeding-correlation",
     "@kneel/babybuddy-sleep-longest-stretch",
+    "@kneel/babybuddy-sleep-regression-watch",
     "@kneel/babybuddy-sleep-totals",
     "@kneel/babybuddy-weight-feeding-correlation",
     "@kneel/babybuddy-feeding-amounts",
@@ -794,35 +905,32 @@ export const model = {
           medication,
           weight,
         ] = await Promise.all([
-          bbList(g, "feedings/", {
+          // Window-bounded types: drain all pages (descending, so a residual
+          // cap-hit keeps the most recent records, not the oldest).
+          bbListAll(g, "feedings/", {
             child,
             start_min: cutoff,
-            limit: 500,
-            ordering: "start",
+            ordering: "-start",
           }),
-          bbList(g, "changes/", {
+          bbListAll(g, "changes/", {
             child,
             date_min: cutoff,
-            limit: 500,
             ordering: "-time",
           }),
-          bbList(g, "sleep/", {
+          bbListAll(g, "sleep/", {
             child,
             start_min: cutoff,
-            limit: 500,
-            ordering: "start",
+            ordering: "-start",
           }),
-          bbList(g, "pumping/", {
+          bbListAll(g, "pumping/", {
             child,
             start_min: cutoff,
-            limit: 500,
-            ordering: "start",
+            ordering: "-start",
           }),
-          bbList(g, "tummy-times/", {
+          bbListAll(g, "tummy-times/", {
             child,
             start_min: cutoff,
-            limit: 500,
-            ordering: "start",
+            ordering: "-start",
           }),
           bbList(g, "notes/", { child, limit: 200, ordering: "-time" }),
           bbList(g, "temperature/", { child, limit: 200, ordering: "-time" }),
