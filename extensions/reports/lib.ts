@@ -489,14 +489,42 @@ const NIGHT_START_HOUR = 21; // 21:00 — a session ending at/after this counts 
 // at, say, 08:15 still counts as night sleep instead of being silently dropped.
 const NIGHT_END_HOUR = 9;
 const MIN_NIGHT_TOTAL_H = 4; // below this, a night is treated as sparse/partial
-const BASELINE_GAP_DAYS = 7; // baseline ends this many nights before the latest
+// Baseline ends this many nights before the latest. Set to 10 (was 7) so a
+// regression onset in the days just before the recent window doesn't bleed into
+// the baseline tail and desensitize it — the slow-onset blind spot.
+const BASELINE_GAP_DAYS = 10;
 const BASELINE_DAYS_DEFAULT = 28; // default trailing baseline length (tracks the child's stage)
 const RECENT_DAYS = 7; // recent window length, in nights
-const MIN_BASELINE_NIGHTS = 10; // need a real distribution before we alarm
+const MIN_BASELINE_NIGHTS = 14; // need a real distribution (post-trim) before we alarm
 const SUSTAIN_NIGHTS = 3; // a signal must persist this many nights
 const SIGMA_K = 1.5; // alarm at μ ± this many σ
 const SIGMA_WATCH = 1.0; // softer band for the early-warning "watch" tier
-const WATCH_MIN_NIGHTS = 2; // this many soft breaches (any metric) ⇒ watch
+const WATCH_MAJORITY_NIGHTS = 4; // single-axis breaches on this many of the recent nights ⇒ watch
+// Baseline onset-guard: if the trailing block of the baseline is already drifting
+// in the regression direction (so the onset bled in despite the gap), trim it and
+// recompute, down to a retained floor. Keeps a trailing baseline from chasing a
+// slow onset. A plain one-pass trim — not CUSUM/PELT (over-engineering here).
+const ONSET_TRIM_BLOCK = 7; // newest baseline nights tested as the trailing block
+const ONSET_TRIM_SIGMA_K = 0.5; // tail drifts if beyond μ_head ± this × σ_head
+const BASELINE_MIN_RETAINED = 14; // never trim below this many baseline nights
+// σ floors (shrinkage) for the SEM denominators, so a pathologically clean
+// baseline can't shrink SEM until z explodes on ordinary noise.
+const SIGMA_FLOOR_STRETCH_H = 0.5;
+const SIGMA_FLOOR_WAKES = 1.0;
+// Single-axis "stretch collapse" → regression. All three gates must hold. (The
+// design here was LLM-assisted, NOT reviewed by a medical professional — these
+// are statistical heuristics, not clinical thresholds.) G1 is variance-aware in
+// SEM units (self-tightens for a high-variance child instead of becoming
+// unreachable, the flaw in the earlier per-night-σ-on-the-mean spec); G2 is an
+// absolute-magnitude floor; G3 is a sustain/pattern check on the SOFT band.
+const COLLAPSE_SEM_K = 2.0; // G1: recent mean ≤ μ − this × SEM
+const COLLAPSE_DROP_FRAC = 0.85; // G2: recent mean ≤ this × μ (≥15% drop) …
+const COLLAPSE_DROP_MIN_H = 45 / 60; // G2: … OR absolute drop ≥ this (45m)
+const COLLAPSE_PATTERN_NIGHTS = 3; // G3: ≥ this many recent nights below μ−1σ
+// Wake-elevation (corroborating) arm: recent mean wakes ≥ μ + this × SEM(wakes).
+// Lower K than the stretch collapse because wakes are noisier/behavior-confounded
+// — it corroborates, it is never a standalone regression trigger.
+const WAKE_SEM_K = 1.5;
 const ABSOLUTE_TRIGGER_H = 2 + 40 / 60; // 2h40m advisory floor (from handoff)
 const MAX_STALE_DAYS = 2; // if the latest night trails the sync by more, refuse a verdict
 
@@ -534,19 +562,74 @@ function popStd(xs: number[], mu: number): number {
   return Math.sqrt(mean(xs.map((x) => (x - mu) ** 2)));
 }
 
-/** Least-squares slope of `ys` against its index (per step); 0 if <2 points. */
-function olsSlope(ys: number[]): number {
-  const n = ys.length;
-  if (n < 2) return 0;
-  const xm = (n - 1) / 2;
-  const ym = mean(ys);
-  let num = 0;
-  let den = 0;
-  for (let i = 0; i < n; i++) {
-    num += (i - xm) * (ys[i] - ym);
-    den += (i - xm) ** 2;
+/** Median of `xs`; 0 for an empty list. */
+function median(xs: number[]): number {
+  if (!xs.length) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/**
+ * Age-band → advisory profile: an absolute longest-stretch floor (hours, or null
+ * to suppress it) and a note about the nearby developmental regression window.
+ * Floors are coarse and advisory; only `<4mo` overrides the generic
+ * {@link ABSOLUTE_TRIGGER_H} (a newborn's sleep isn't consolidated, so an
+ * absolute floor would be alarmist). Per-band floor *values* beyond that are a
+ * deliberate TODO pending an actual clinician's age-specific curve — do not invent them.
+ * A null/unknown band keeps the generic floor and emits no window note.
+ */
+function ageProfile(
+  band: string | null,
+): { floorH: number | null; windowNote: string } {
+  switch (band) {
+    case "<4mo":
+      return {
+        floorH: null,
+        windowNote:
+          "Under ~4 months sleep isn't consolidated yet, so the absolute-stretch floor is suppressed; the ~4-month regression (a lasting change in sleep architecture) is still ahead.",
+      };
+    case "4-5mo":
+      return {
+        floorH: ABSOLUTE_TRIGGER_H,
+        windowNote:
+          "In the ~4-month regression window — this is a lasting change in sleep architecture, not a phase that simply reverts.",
+      };
+    case "6-7mo":
+      return {
+        floorH: ABSOLUTE_TRIGGER_H,
+        windowNote: "Between the ~4-month and ~8–10-month regression windows.",
+      };
+    case "8-10mo":
+      return {
+        floorH: ABSOLUTE_TRIGGER_H,
+        windowNote:
+          "In the ~8–10-month regression window — often driven by separation anxiety and motor milestones (pulling to stand).",
+      };
+    case "11-13mo":
+      return {
+        floorH: ABSOLUTE_TRIGGER_H,
+        windowNote:
+          "Around the ~12-month regression — frequently a nap transition in disguise.",
+      };
+    case "14-17mo":
+      return {
+        floorH: ABSOLUTE_TRIGGER_H,
+        windowNote: "Between the ~12-month and ~18-month regression windows.",
+      };
+    case "18-24mo":
+      return {
+        floorH: ABSOLUTE_TRIGGER_H,
+        windowNote: "Around the ~18-month regression.",
+      };
+    case "24mo+":
+      return {
+        floorH: ABSOLUTE_TRIGGER_H,
+        windowNote: "Past the common infant regression windows.",
+      };
+    default:
+      return { floorH: ABSOLUTE_TRIGGER_H, windowNote: "" };
   }
-  return den === 0 ? 0 : num / den;
 }
 
 /** Longest run of consecutive list entries (by position) satisfying `pred`. */
@@ -568,9 +651,9 @@ function maxRun<T>(items: T[], pred: (x: T) => boolean): number {
 interface NightRow {
   nightDate: string;
   longestStretchH: number;
-  wakes: number; // total intra-night awakenings
-  fedWakes: number; // awakenings with a feed in the gap
-  spontaneousWakes: number; // wakes − fedWakes (the regression-relevant axis)
+  wakes: number; // total intra-night awakenings (the alarm axis)
+  fedWakes: number; // awakenings with a feed in the gap (displayed context)
+  spontaneousWakes: number; // wakes − fedWakes (displayed context)
   nightTotalH: number;
   excluded: boolean;
   stretchLow: boolean;
@@ -587,15 +670,20 @@ interface NightRow {
  * default the baseline is a trailing {@link BASELINE_DAYS_DEFAULT}-night window
  * (so it tracks the child's current stage, not blended newborn history); pass
  * `baselineDays: 0` to span the whole synced window, or a positive N for a fixed
- * length. The wake axis is *spontaneous* wakes — awakenings without a feed in the
- * gap — since normal night feeds shouldn't read as regression. It also appends a
+ * length. The wake axis is *total* wakes measured against the child's own
+ * baseline — excluding fed wakings blinded the detector for a breastfed infant
+ * (almost every waking has a nurse in the gap), while a per-child baseline keeps
+ * a stable night-feeder from reading as pathology. It also appends a
  * non-diagnostic safety layer (see {@link safetyNotes}). A regression is flagged
  * only when BOTH the longest stretch craters
  * (< μ − 1.5σ) AND wakes spike (> μ + 1.5σ) for ≥3 consecutive nights; a single
- * condition alone is labelled `nap_fragmentation`. Short of those, ≥{@link
- * WATCH_MIN_NIGHTS} recent nights breaching a softer μ±1σ band raise an
- * early-warning `watch`. Also reports the recent longest-stretch trend
- * (min/week) as a leading indicator. Detects; only the trend hints ahead.
+ * condition alone is labelled `nap_fragmentation`. Short of those, an
+ * early-warning `watch` fires on any of: ≥3 soft μ±1σ breaches, a single metric
+ * past its hard threshold on a majority (≥{@link WATCH_MAJORITY_NIGHTS}) of
+ * recent nights, a conservative absolute-drop in the recent longest-stretch
+ * mean, or an age-aware absolute floor breached on a majority of nights. An
+ * optional anonymized age band (`e.ageBand`) tunes the absolute floor and adds a
+ * developmental-window note. Detects; does not predict.
  *
  * Assumes Baby Buddy timestamps are in the child's local timezone (the same
  * naive-local convention {@link aggregateByDate} uses). Needs ≥{@link
@@ -741,21 +829,60 @@ export function regressionWatch(
     : addDays(latest, -(BASELINE_GAP_DAYS + baselineDays - 1));
   const recentLo = addDays(latest, -(RECENT_DAYS - 1));
 
-  const baseline = rows.filter((r) =>
+  const baselineFull = rows.filter((r) =>
     !r.excluded && r.nightDate >= baselineLo && r.nightDate <= baselineHi
-  );
+  ); // date-ascending (rows derives from sorted nightDates)
   const recent = rows.filter((r) => r.nightDate >= recentLo); // incl. excluded
 
-  // The wake axis is SPONTANEOUS wakes (fed wakings are normal for a breastfed
-  // infant and shouldn't count toward a regression signal).
+  // Onset-guard: iteratively drop the trailing block while it drifts in the
+  // regression direction (shorter stretch OR more wakes) relative to the head,
+  // so a slow onset that bled into the baseline tail doesn't desensitize it.
+  // Floored σ keeps a very clean head from trimming everything.
+  const nightsTrimmed = (() => {
+    let b = baselineFull;
+    let trimmed = 0;
+    while (b.length - ONSET_TRIM_BLOCK >= BASELINE_MIN_RETAINED) {
+      const head = b.slice(0, b.length - ONSET_TRIM_BLOCK);
+      const tail = b.slice(b.length - ONSET_TRIM_BLOCK);
+      const muHStretch = mean(head.map((r) => r.longestStretchH));
+      const muHWakes = mean(head.map((r) => r.wakes));
+      const sHStretch = Math.max(
+        popStd(head.map((r) => r.longestStretchH), muHStretch),
+        SIGMA_FLOOR_STRETCH_H,
+      );
+      const sHWakes = Math.max(
+        popStd(head.map((r) => r.wakes), muHWakes),
+        SIGMA_FLOOR_WAKES,
+      );
+      const tailStretch = mean(tail.map((r) => r.longestStretchH));
+      const tailWakes = mean(tail.map((r) => r.wakes));
+      if (
+        tailStretch < muHStretch - ONSET_TRIM_SIGMA_K * sHStretch ||
+        tailWakes > muHWakes + ONSET_TRIM_SIGMA_K * sHWakes
+      ) {
+        b = head;
+        trimmed += ONSET_TRIM_BLOCK;
+      } else break;
+    }
+    return { baseline: b, trimmed };
+  })();
+  const baseline = nightsTrimmed.baseline;
+
+  // The wake axis is TOTAL wakes. Excluding fed wakings (an earlier design)
+  // blinded the detector for a breastfed infant, where nearly every real waking
+  // has a nurse logged in the gap — it filtered 4–5 wakes/night down to ~1 and
+  // the wake arm could never fire. Total wakes against the child's OWN baseline
+  // self-normalizes: a baby who always feeds 4×/night has a high μ and won't
+  // trip; only a rise ABOVE that baseline does. (fed/spontaneous are kept for
+  // display so a human can still see whether a spike is feeding-associated.)
   const rawMuStretch = mean(baseline.map((r) => r.longestStretchH));
-  const rawMuWakes = mean(baseline.map((r) => r.spontaneousWakes));
+  const rawMuWakes = mean(baseline.map((r) => r.wakes));
   const rawSigmaStretch = popStd(
     baseline.map((r) => r.longestStretchH),
     rawMuStretch,
   );
   const rawSigmaWakes = popStd(
-    baseline.map((r) => r.spontaneousWakes),
+    baseline.map((r) => r.wakes),
     rawMuWakes,
   );
 
@@ -774,7 +901,7 @@ export function regressionWatch(
   for (const r of recent) {
     if (r.excluded) continue;
     r.stretchLow = r.longestStretchH < stretchLowH;
-    r.wakesHigh = r.spontaneousWakes > wakesHighCount;
+    r.wakesHigh = r.wakes > wakesHighCount;
   }
 
   const recentActive = recent.filter((r) => !r.excluded);
@@ -784,8 +911,7 @@ export function regressionWatch(
   const absoluteTriggerHit = sevenDayMeanStretchH !== null &&
     sevenDayMeanStretchH < ABSOLUTE_TRIGGER_H;
 
-  // Early-warning ("watch") signals: recent nights breaching a softer μ±1σ band,
-  // plus the recent longest-stretch trend (leading edge of a regression).
+  // Early-warning ("watch") signals: recent nights breaching a softer μ±1σ band.
   const softStretchLowH = Math.max(
     0,
     rawMuStretch - SIGMA_WATCH * rawSigmaStretch,
@@ -794,18 +920,88 @@ export function regressionWatch(
   const watchNights =
     recentActive.filter((r) =>
       r.longestStretchH < softStretchLowH ||
-      r.spontaneousWakes > softWakesHighCount
+      r.wakes > softWakesHighCount
     ).length;
-  // Slope of recent longest stretch, in minutes/week (recentActive is date-asc).
-  const stretchTrendMinPerWeek = round1(
-    olsSlope(recentActive.map((r) => r.longestStretchH)) * 60 * 7,
+
+  // Trend as a robust recent-vs-baseline median shift (minutes). An OLS slope
+  // over ~7 noisy nights is dominated by night-to-night variance and misreads
+  // direction (it once printed "improving" on a clearly bad week), so it no
+  // longer gates the verdict — this median delta is display-only context.
+  const baselineMedianStretchH = round2(
+    median(baseline.map((r) => r.longestStretchH)),
   );
-  // Raised watch bar: only fire on a real leading edge — several soft breaches,
-  // or a couple paired with an actually-declining trend. The trend arm needs a
-  // meaningful sample (≥5 active nights) so a 2-point "slope" can't cry wolf.
-  const watchTriggered = watchNights >= 3 ||
-    (watchNights >= WATCH_MIN_NIGHTS && recentActive.length >= 5 &&
-      stretchTrendMinPerWeek < 0);
+  const recentMedianStretchH = recentActive.length
+    ? round2(median(recentActive.map((r) => r.longestStretchH)))
+    : null;
+  const stretchShiftMin = recentMedianStretchH === null
+    ? null
+    : round1((recentMedianStretchH - baselineMedianStretchH) * 60);
+
+  // Age-aware absolute floor (null ⇒ suppressed, e.g. newborns) + window note.
+  const { floorH: absoluteFloorH, windowNote } = ageProfile(e.ageBand ?? null);
+
+  // Single-axis STRETCH COLLAPSE → regression (not just watch). For a child
+  // whose baseline waking is already high, the wake axis is saturated and can't
+  // register a regression, so a sustained collapse of the night longest stretch
+  // must qualify on its own. Three gates, all required:
+  //   G1 variance-aware mean shift: recent mean ≤ μ − 2·SEM (SEM = σ/√n). Tightens
+  //      for a high-variance child instead of becoming unreachable.
+  //   G2 absolute magnitude: recent mean ≤ 85% of μ (≥15% drop) OR drop ≥ 45m.
+  //   G3 pattern: ≥3 recent nights below the SOFT (μ−1σ) per-night floor — a
+  //      pattern, so two catastrophic nights can't carry it alone.
+  const recentActiveN = recentActive.length;
+  // σ floored so a very clean baseline can't shrink SEM until z explodes on noise.
+  const sigmaStretchEff = Math.max(rawSigmaStretch, SIGMA_FLOOR_STRETCH_H);
+  const stretchSem = recentActiveN > 0
+    ? sigmaStretchEff / Math.sqrt(recentActiveN)
+    : 0;
+  const collapseG1 = sevenDayMeanStretchH !== null &&
+    sevenDayMeanStretchH <= rawMuStretch - COLLAPSE_SEM_K * stretchSem;
+  const collapseG2 = sevenDayMeanStretchH !== null &&
+    (sevenDayMeanStretchH <= COLLAPSE_DROP_FRAC * rawMuStretch ||
+      rawMuStretch - sevenDayMeanStretchH >= COLLAPSE_DROP_MIN_H);
+  const softFloorNights =
+    recentActive.filter((r) => r.longestStretchH < softStretchLowH).length;
+  const collapseG3 = softFloorNights >= COLLAPSE_PATTERN_NIGHTS;
+  const stretchCollapse = collapseG1 && collapseG2 && collapseG3;
+
+  // Wake-elevation (corroborating): recent mean wakes risen ≥ WAKE_SEM_K·SEM above
+  // baseline. Not a standalone regression trigger (wakes are noisier); it raises
+  // confidence when paired with a stretch collapse (concordant onset), and on its
+  // own only reaches `watch`.
+  const sigmaWakesEff = Math.max(rawSigmaWakes, SIGMA_FLOOR_WAKES);
+  const wakeSem = recentActiveN > 0
+    ? sigmaWakesEff / Math.sqrt(recentActiveN)
+    : 0;
+  const recentMeanWakes = recentActiveN > 0
+    ? round2(mean(recentActive.map((r) => r.wakes)))
+    : null;
+  const wakeElevated = recentMeanWakes !== null &&
+    recentMeanWakes >= rawMuWakes + WAKE_SEM_K * wakeSem;
+  const concordant = stretchCollapse && wakeElevated;
+
+  // --- Early-warning (watch) arms; each is a distinct signal and the verdict
+  // records which fired. None escalates past `watch` on its own.
+  // 1. Soft μ±1σ breaches on either axis, on ≥3 recent nights.
+  const softBreach = watchNights >= 3;
+  // 2. Single-axis majority: a metric past its HARD threshold on a majority of
+  //    recent nights — catches "most nights bad, one good night", which the
+  //    strict consecutive-run rule misses, short of a full collapse.
+  const stretchLowNights = recentActive.filter((r) => r.stretchLow).length;
+  const wakesHighNights = recentActive.filter((r) => r.wakesHigh).length;
+  const majorityBreach = stretchLowNights >= WATCH_MAJORITY_NIGHTS ||
+    wakesHighNights >= WATCH_MAJORITY_NIGHTS;
+  // 3. Age-aware absolute floor breached on a majority of recent nights.
+  const floorBreachNights = absoluteFloorH === null
+    ? 0
+    : recentActive.filter((r) => r.longestStretchH < absoluteFloorH).length;
+  const floorBreach = absoluteFloorH !== null &&
+    floorBreachNights >= WATCH_MAJORITY_NIGHTS;
+
+  // 4. Wake elevation (SEM-based) on its own — wakes risen vs baseline but no
+  //    stretch collapse. Corroborating-only, so it reaches `watch`, not regression.
+  const watchTriggered = softBreach || majorityBreach || floorBreach ||
+    wakeElevated;
 
   const bothRun = maxRun(recentActive, (r) => r.stretchLow && r.wakesHigh);
   const stretchOnlyRun = maxRun(
@@ -836,25 +1032,68 @@ export function regressionWatch(
     note = `Longest stretch < ${
       fmtHM(stretchLowHR)
     } AND wakes > ${wakesHighCountR} for ${bothRun} consecutive nights.`;
-  } else if (
-    stretchOnlyRun >= SUSTAIN_NIGHTS || wakesOnlyRun >= SUSTAIN_NIGHTS
-  ) {
+  } else if (stretchCollapse) {
+    // Collapse of the night longest stretch — a regression in its own right. When
+    // wakes are ALSO elevated vs baseline it's a concordant two-axis onset (higher
+    // confidence); otherwise the wake axis may just be saturated at a high baseline.
+    status = "regression";
+    note = `Longest stretch collapsed: recent mean ${
+      sevenDayMeanStretchH === null ? "—" : fmtHM(sevenDayMeanStretchH)
+    } vs baseline ${fmtHM(muStretch)} (${
+      stretchShiftMin === null ? "—" : `${stretchShiftMin} min`
+    } shift), ${softFloorNights}/${recentActiveN} nights below ${
+      fmtHM(round2(softStretchLowH))
+    }. ${
+      concordant
+        ? `Night wakes are also elevated (recent mean ${recentMeanWakes} vs baseline ${muWakes}) — a concordant two-axis regression.`
+        : "Night wakes aren't elevated vs baseline (consolidation-only collapse)."
+    }`;
+  } else if (stretchOnlyRun >= SUSTAIN_NIGHTS) {
+    // Night longest stretch low but short of a full collapse — not the daytime
+    // "nap fragmentation" concept; a milder night-consolidation concern.
+    status = "night_consolidation_loss";
+    note =
+      `Longest stretch low but wakes normal for ${stretchOnlyRun} consecutive nights — a night-consolidation dip short of a full collapse.`;
+  } else if (wakesOnlyRun >= SUSTAIN_NIGHTS) {
     status = "nap_fragmentation";
-    note = stretchOnlyRun >= SUSTAIN_NIGHTS
-      ? `Longest stretch low but wakes normal for ${stretchOnlyRun} nights — fragmentation, not regression.`
-      : `Wakes elevated but longest stretch holding for ${wakesOnlyRun} nights — fragmentation, not regression.`;
+    note =
+      `Wakes elevated but longest stretch holding for ${wakesOnlyRun} nights — fragmentation, not regression.`;
   } else if (watchTriggered) {
     status = "watch";
-    const trend = stretchTrendMinPerWeek < 0
-      ? ` Longest-stretch trend ${stretchTrendMinPerWeek} min/wk (declining).`
-      : "";
-    note =
-      `Early warning: ${watchNights} of the last ${recentActive.length} nights breached the soft μ±1σ band (spontaneous wakes).${trend} Not a regression yet — worth keeping an eye out.`;
+    const reasons: string[] = [];
+    if (softBreach) {
+      reasons.push(
+        `${watchNights} of the last ${recentActive.length} nights breached the soft μ±1σ band`,
+      );
+    }
+    if (majorityBreach) {
+      reasons.push(
+        `low longest stretch on ${stretchLowNights}/${recentActive.length} and high wakes on ${wakesHighNights}/${recentActive.length} recent nights`,
+      );
+    }
+    if (floorBreach && absoluteFloorH !== null) {
+      reasons.push(
+        `longest stretch under the ${
+          fmtHM(round2(absoluteFloorH))
+        } floor on ${floorBreachNights}/${recentActive.length} nights`,
+      );
+    }
+    if (wakeElevated) {
+      reasons.push(
+        `night wakes risen (recent mean ${recentMeanWakes} vs baseline ${muWakes})`,
+      );
+    }
+    note = `Early warning: ${
+      reasons.join("; ")
+    }. Not a regression yet — worth keeping an eye out.`;
   } else {
     status = "normal";
     note =
       "No sustained (≥3-night) drop in longest stretch combined with elevated wakes.";
   }
+
+  // Age context (advisory) rides along with any verdict when a band is present.
+  if (windowNote) note += ` ${windowNote}`;
 
   // Truncation is advisory only — it doesn't suppress a verdict (the sleep data
   // may be complete even if some other record type hit the cap), but flag it so
@@ -873,22 +1112,48 @@ export function regressionWatch(
     latestNight: latest,
     staleDays,
     baselineDays,
+    ageBand: e.ageBand ?? null,
+    windowNote: windowNote || null,
     baseline: {
       nights: baseline.length,
+      nightsTrimmed: nightsTrimmed.trimmed, // onset-guard: tail nights dropped
       muStretchH: muStretch,
       sigmaStretchH: sigmaStretch,
-      muWakes, // spontaneous wakes
+      muWakes, // total wakes
       sigmaWakes,
     },
     thresholds: {
       stretchLowH: stretchLowHR,
-      wakesHighCount: wakesHighCountR, // on spontaneous wakes
-      absoluteTriggerH: round2(ABSOLUTE_TRIGGER_H),
+      wakesHighCount: wakesHighCountR, // on total wakes
+      absoluteFloorH: absoluteFloorH === null ? null : round2(absoluteFloorH),
     },
     sevenDayMeanStretchH,
     absoluteTriggerHit,
-    stretchTrendMinPerWeek,
+    baselineMedianStretchH,
+    recentMedianStretchH,
+    stretchShiftMin,
     watchNights,
+    stretchCollapse: {
+      triggered: stretchCollapse,
+      g1SemShift: collapseG1,
+      g2Magnitude: collapseG2,
+      g3Pattern: collapseG3,
+      semThresholdH: round2(rawMuStretch - COLLAPSE_SEM_K * stretchSem),
+      softFloorNights,
+    },
+    wakeElevation: {
+      elevated: wakeElevated,
+      concordant, // stretch collapse AND wakes elevated = two-axis onset
+      recentMeanWakes,
+      semThreshold: round2(rawMuWakes + WAKE_SEM_K * wakeSem),
+    },
+    watchArms: {
+      softBreach,
+      majorityBreach,
+      floorBreach,
+      stretchLowNights,
+      wakesHighNights,
+    },
     recent: recent.map((r) => ({
       nightDate: r.nightDate,
       longestStretchH: r.longestStretchH,
@@ -905,6 +1170,7 @@ export function regressionWatch(
 
   const statusLabel: Record<string, string> = {
     regression: "🔴 REGRESSION",
+    night_consolidation_loss: "🟠 night consolidation loss",
     nap_fragmentation: "🟠 nap fragmentation",
     watch: "🟡 watch (early warning)",
     normal: "🟢 normal",
@@ -917,31 +1183,33 @@ export function regressionWatch(
     "",
     `Baseline (${baseline.length} nights, trailing): longest stretch μ=${
       fmtHM(muStretch)
-    } σ=${fmtHM(sigmaStretch)}; spont. wakes μ=${muWakes} σ=${sigmaWakes}.`,
+    } σ=${fmtHM(sigmaStretch)}; wakes μ=${muWakes} σ=${sigmaWakes}.`,
     `Alarm thresholds: longest < ${
       fmtHM(stretchLowHR)
-    }, spont. wakes > ${wakesHighCountR}.`,
+    }, wakes > ${wakesHighCountR}.`,
     `7-night mean longest stretch: ${
       sevenDayMeanStretchH === null ? "—" : fmtHM(sevenDayMeanStretchH)
-    } (absolute trigger ${fmtHM(round2(ABSOLUTE_TRIGGER_H))}${
-      absoluteTriggerHit ? " — HIT" : ""
-    }).`,
-    `Longest-stretch trend (recent): ${
-      stretchTrendMinPerWeek >= 0 ? "+" : ""
-    }${stretchTrendMinPerWeek} min/week ${
-      stretchTrendMinPerWeek > 0
-        ? "↑ improving"
-        : stretchTrendMinPerWeek < 0
-        ? "↓ declining"
-        : "→ flat"
-    }; ${watchNights} recent night(s) breaching the soft μ±1σ band.`,
+    } (absolute floor ${
+      absoluteFloorH === null
+        ? "n/a (suppressed for age)"
+        : fmtHM(round2(absoluteFloorH))
+    }${absoluteTriggerHit ? " — generic 2h40m trigger HIT" : ""}).`,
+    `Longest-stretch shift (recent median vs baseline median): ${
+      stretchShiftMin === null
+        ? "—"
+        : `${stretchShiftMin >= 0 ? "+" : ""}${stretchShiftMin} min ${
+          stretchShiftMin > 0 ? "↑" : stretchShiftMin < 0 ? "↓" : "→"
+        }`
+    }; ${watchNights} recent night(s) breaching the soft μ±1σ band.${
+      e.ageBand ? ` Age band: ${e.ageBand}.` : ""
+    }`,
     "",
     table(
-      ["Night", "Longest", "Wakes (spont+fed)", "Night total", "Flags"],
+      ["Night", "Longest", "Wakes (total; spont+fed)", "Night total", "Flags"],
       recent.map((r) => [
         r.nightDate,
         fmtHM(r.longestStretchH),
-        `${r.spontaneousWakes} (+${r.fedWakes})`,
+        `${r.wakes} (${r.spontaneousWakes}+${r.fedWakes})`,
         fmtHM(r.nightTotalH),
         r.excluded ? "excluded" : ([
           r.stretchLow ? "stretch↓" : "",

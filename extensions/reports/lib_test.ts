@@ -69,6 +69,7 @@ const fixture: EntriesSnapshot = {
   medication: [],
   weight: [{ date: "2026-07-10", weight: 5.25 }],
   truncated: false,
+  ageBand: null,
 };
 
 const empty: EntriesSnapshot = {
@@ -85,6 +86,7 @@ const empty: EntriesSnapshot = {
   medication: [],
   weight: [],
   truncated: false,
+  ageBand: null,
 };
 
 Deno.test("fmtHM formats hours", () => {
@@ -379,6 +381,25 @@ function nightSessions(
   return out;
 }
 
+/**
+ * Feedings placed strictly inside the first `count` awake gaps of the sleep
+ * sessions {@link nightSessions} builds for `night`, so each lands in a distinct
+ * gap and credits one fed wake. Mirrors the breastfed case where nearly every
+ * waking has a nurse logged in it.
+ */
+function fedFeedings(
+  night: string,
+  count: number,
+): Array<Record<string, unknown>> {
+  const morning = ad(night, 1);
+  const out: Array<Record<string, unknown>> = [];
+  for (let g = 0; g < count; g++) {
+    const t = g === 0 ? "01:15" : `${String(g + 1).padStart(2, "0")}:45`;
+    out.push({ start: `${morning}T${t}:00Z`, method: "both breasts" });
+  }
+  return out;
+}
+
 const LATEST = "2026-09-13";
 
 /** Snapshot with a uniform baseline; `recent` overrides the last 7 nights. */
@@ -388,8 +409,9 @@ function watchSnapshot(
   >,
 ): EntriesSnapshot {
   const sleep: Array<Record<string, unknown>> = [];
-  // 12 uniform baseline nights (longest 3.5h, 2 wakes) inside [latest-27, latest-7].
-  for (let k = 7; k <= 18; k++) {
+  // 18 uniform baseline nights (longest 3.5h, 2 wakes) inside the baseline window
+  // [latest-37, latest-10] (BASELINE_GAP_DAYS=10 ⇒ baseline ends at latest-10).
+  for (let k = 10; k <= 27; k++) {
     sleep.push(...nightSessions(ad(LATEST, -k), 3.5, 2));
   }
   for (const r of recent) {
@@ -418,12 +440,12 @@ Deno.test("regressionWatch flags a sustained regression (stretch↓ AND wakes↑
   ]);
   const j = regressionWatch(snap).json as Record<string, unknown>;
   assertEquals(j.status, "regression");
-  assertEquals((j.baseline as { nights: number }).nights, 12);
+  assertEquals((j.baseline as { nights: number }).nights, 18);
   // Uniform baseline ⇒ σ=0 ⇒ thresholds equal the baseline means.
   assertEquals(j.thresholds, {
     stretchLowH: 3.5,
     wakesHighCount: 2,
-    absoluteTriggerH: 2.67,
+    absoluteFloorH: 2.67,
   });
   const recent = j.recent as Array<Record<string, unknown>>;
   assertEquals(recent.length, 7);
@@ -460,7 +482,182 @@ Deno.test("regressionWatch reports normal when recent tracks baseline", () => {
   assertEquals(regressionWatch(snap).json.status, "normal");
 });
 
-Deno.test("regressionWatch raises 'watch' on 3 soft breaches, but not on 2 with a flat trend", () => {
+Deno.test("regressionWatch counts fed wakes (breastfed) toward the wake axis", () => {
+  // Baseline: 12 calm nights (3.5h, 2 wakes, no feeds). Recent: 3 bad nights
+  // where EVERY waking has a nurse in the gap. The old spontaneous-only axis
+  // wrote these off (spontaneous≈0 ⇒ nap_fragmentation at most); total wakes
+  // against the child's own baseline now flags the regression.
+  const sleep: Array<Record<string, unknown>> = [];
+  const feedings: Array<Record<string, unknown>> = [];
+  for (let k = 10; k <= 27; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 3.5, 2));
+  }
+  const recent = [
+    { k: 6, longestH: 3.5, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 1.5, wakes: 5 },
+    { k: 1, longestH: 1.5, wakes: 5 },
+    { k: 0, longestH: 1.5, wakes: 5 },
+  ];
+  for (const r of recent) {
+    sleep.push(...nightSessions(ad(LATEST, -r.k), r.longestH, r.wakes));
+    if (r.longestH < 3) {
+      feedings.push(...fedFeedings(ad(LATEST, -r.k), r.wakes));
+    }
+  }
+  const snap: EntriesSnapshot = {
+    ...empty,
+    fetchedAt: "2026-09-14T12:00:00Z",
+    sinceHours: 720,
+    sleep,
+    feedings,
+  };
+  const j = regressionWatch(snap).json as Record<string, unknown>;
+  assertEquals(j.status, "regression");
+  const rows = j.recent as Array<Record<string, unknown>>;
+  const last = rows.find((r) => r.nightDate === LATEST)!;
+  assertEquals(last.wakes, 5);
+  assertEquals(last.fedWakes, 5); // every waking was a nurse
+  assertEquals(last.spontaneousWakes, 0); // old axis would read ~0 and miss it
+  assertEquals(last.wakesHigh, true); // total-wakes axis fires
+});
+
+Deno.test("regressionWatch raises 'watch' on a non-consecutive majority of low-stretch nights", () => {
+  // 4 of 7 nights low on longest stretch but interleaved (no 3 consecutive) ⇒
+  // not nap_fragmentation; the majority arm still raises an early warning. 2.75h
+  // keeps the night total above the sparse floor and above the absolute floor,
+  // so the low-stretch majority (not an excluded-night or floor artifact) drives it.
+  const snap = watchSnapshot([
+    { k: 6, longestH: 2.75, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 2.75, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 2.75, wakes: 2 },
+    { k: 1, longestH: 3.5, wakes: 2 },
+    { k: 0, longestH: 2.75, wakes: 2 },
+  ]);
+  const j = regressionWatch(snap).json as Record<string, unknown>;
+  assertEquals(j.status, "watch");
+  assertEquals((j.watchArms as Record<string, unknown>).majorityBreach, true);
+});
+
+Deno.test("regressionWatch applies an anonymized age band (floor + window note)", () => {
+  const base = [
+    { k: 6, longestH: 3.5, wakes: 2 },
+    { k: 5, longestH: 3.5, wakes: 2 },
+    { k: 4, longestH: 3.5, wakes: 2 },
+    { k: 3, longestH: 3.5, wakes: 2 },
+    { k: 2, longestH: 3.5, wakes: 2 },
+    { k: 1, longestH: 3.5, wakes: 2 },
+    { k: 0, longestH: 3.5, wakes: 2 },
+  ];
+  // <4mo: the absolute floor is suppressed (newborn sleep isn't consolidated)
+  // and the note flags the architectural ~4-month regression ahead.
+  const newborn = { ...watchSnapshot(base), ageBand: "<4mo" };
+  const jn = regressionWatch(newborn).json as Record<string, unknown>;
+  assertEquals(jn.ageBand, "<4mo");
+  assertEquals((jn.thresholds as Record<string, unknown>).absoluteFloorH, null);
+  assertEquals((jn.windowNote as string).includes("4-month"), true);
+
+  // 8-10mo: generic floor applies, note names the window.
+  const older = { ...watchSnapshot(base), ageBand: "8-10mo" };
+  const jo = regressionWatch(older).json as Record<string, unknown>;
+  assertEquals((jo.thresholds as Record<string, unknown>).absoluteFloorH, 2.67);
+  assertEquals((jo.windowNote as string).includes("8"), true);
+});
+
+Deno.test("regressionWatch flags a single-axis stretch collapse as regression (flat wakes)", () => {
+  // Longest stretch sustained-low but wakes NORMAL — the high-baseline-waker
+  // case where the wake axis can't register the event, so the stretch collapse
+  // must qualify on its own (would have been mislabeled nap_fragmentation before).
+  const snap = watchSnapshot([
+    { k: 6, longestH: 2.6, wakes: 2 },
+    { k: 5, longestH: 2.6, wakes: 2 },
+    { k: 4, longestH: 2.6, wakes: 2 },
+    { k: 3, longestH: 2.6, wakes: 2 },
+    { k: 2, longestH: 2.6, wakes: 2 },
+    { k: 1, longestH: 2.6, wakes: 2 },
+    { k: 0, longestH: 2.6, wakes: 2 },
+  ]);
+  const j = regressionWatch(snap).json as Record<string, unknown>;
+  assertEquals(j.status, "regression");
+  assertEquals(
+    (j.stretchCollapse as Record<string, unknown>).triggered,
+    true,
+  );
+  // It's the single-axis path: no night had elevated wakes.
+  const rows = j.recent as Array<Record<string, unknown>>;
+  assertEquals(rows.every((r) => r.wakesHigh === false), true);
+});
+
+Deno.test("regressionWatch marks a concordant two-axis onset (stretch collapse + wake elevation)", () => {
+  // Stretch collapses AND wakes rise together ⇒ wakeElevated corroborates,
+  // concordant=true (highest-confidence regression).
+  const snap = watchSnapshot([
+    { k: 6, longestH: 2.0, wakes: 4 },
+    { k: 5, longestH: 2.0, wakes: 4 },
+    { k: 4, longestH: 2.0, wakes: 4 },
+    { k: 3, longestH: 2.0, wakes: 4 },
+    { k: 2, longestH: 2.0, wakes: 4 },
+    { k: 1, longestH: 2.0, wakes: 4 },
+    { k: 0, longestH: 2.0, wakes: 4 },
+  ]);
+  const j = regressionWatch(snap).json as Record<string, unknown>;
+  assertEquals(j.status, "regression");
+  const we = j.wakeElevation as Record<string, unknown>;
+  assertEquals(we.elevated, true);
+  assertEquals(we.concordant, true);
+});
+
+Deno.test("regressionWatch onset-guard trims a baseline tail already drifting into the regression", () => {
+  // Baseline head (older) is healthy; the newest 7 baseline nights are degraded
+  // (a slow onset that bled past the gap). The guard trims that block so the
+  // baseline stats reflect the pre-onset head, not the contamination.
+  const sleep: Array<Record<string, unknown>> = [];
+  // 14 healthy head nights (k=17..30) + 7 degraded trailing baseline nights (k=10..16).
+  for (let k = 17; k <= 30; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 3.9, 2));
+  }
+  for (let k = 10; k <= 16; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 2.5, 5)); // onset bleed
+  }
+  for (let k = 0; k <= 6; k++) {
+    sleep.push(...nightSessions(ad(LATEST, -k), 3.9, 2)); // benign recent
+  }
+  const snap: EntriesSnapshot = {
+    ...empty,
+    fetchedAt: "2026-09-14T12:00:00Z",
+    sinceHours: 2160,
+    sleep,
+  };
+  const base = regressionWatch(snap).json.baseline as {
+    nights: number;
+    nightsTrimmed: number;
+    muStretchH: number;
+  };
+  assertEquals(base.nightsTrimmed, 7); // the degraded trailing block was dropped
+  assertEquals(base.nights, 14); // only the healthy head retained
+  assertEquals(base.muStretchH, 3.9); // stats reflect the pre-onset head
+});
+
+Deno.test("regressionWatch labels a mild sustained stretch dip as night_consolidation_loss", () => {
+  // Below baseline and sustained, but short of the collapse magnitude (G2) ⇒ the
+  // renamed intermediate tier, not regression and not the daytime 'fragmentation'.
+  const snap = watchSnapshot([
+    { k: 6, longestH: 3.2, wakes: 2 },
+    { k: 5, longestH: 3.2, wakes: 2 },
+    { k: 4, longestH: 3.2, wakes: 2 },
+    { k: 3, longestH: 3.2, wakes: 2 },
+    { k: 2, longestH: 3.2, wakes: 2 },
+    { k: 1, longestH: 3.2, wakes: 2 },
+    { k: 0, longestH: 3.2, wakes: 2 },
+  ]);
+  assertEquals(regressionWatch(snap).json.status, "night_consolidation_loss");
+});
+
+Deno.test("regressionWatch raises 'watch' on 3 soft breaches, but not on 2", () => {
   // 3 non-consecutive soft breaches (no 3-night hard run) ⇒ watch.
   const three = watchSnapshot([
     { k: 6, longestH: 3.5, wakes: 3 }, // breach
@@ -475,7 +672,7 @@ Deno.test("regressionWatch raises 'watch' on 3 soft breaches, but not on 2 with 
   assertEquals(j.status, "watch");
   assertEquals(j.watchNights, 3);
 
-  // Only 2 breaches and a flat trend ⇒ raised bar not met ⇒ normal (no crying wolf).
+  // Only 2 soft breaches (<3) and no majority ⇒ bar not met ⇒ normal (no crying wolf).
   const two = watchSnapshot([
     { k: 6, longestH: 3.5, wakes: 2 },
     { k: 5, longestH: 3.5, wakes: 2 },
@@ -483,7 +680,7 @@ Deno.test("regressionWatch raises 'watch' on 3 soft breaches, but not on 2 with 
     { k: 3, longestH: 3.5, wakes: 2 },
     { k: 2, longestH: 3.5, wakes: 3 }, // breach
     { k: 1, longestH: 3.5, wakes: 2 },
-    { k: 0, longestH: 3.5, wakes: 3 }, // breach (non-consecutive), flat trend
+    { k: 0, longestH: 3.5, wakes: 3 }, // breach (non-consecutive)
   ]);
   assertEquals(regressionWatch(two).json.status, "normal");
 });
@@ -641,14 +838,14 @@ Deno.test("regressionWatch baseline defaults to a 28-night trailing window (base
     sinceHours: 2160,
     sleep,
   };
-  // Default: trailing 28-night window (latest-34 .. latest-7).
+  // Default: trailing 28-night window (latest-37 .. latest-10, gap=10).
   const def = regressionWatch(snap).json.baseline as { nights: number };
   assertEquals(def.nights, 28);
-  // baselineDays=0: span every available night before the recent window.
+  // baselineDays=0: span every available night before the gap (k=10..46 = 37).
   const spanned = regressionWatch(snap, { baselineDays: 0 }).json.baseline as {
     nights: number;
   };
-  assertEquals(spanned.nights, 40);
+  assertEquals(spanned.nights, 37);
   // baselineDays=21: fixed trailing 21-night window.
   const capped = regressionWatch(snap, { baselineDays: 21 }).json.baseline as {
     nights: number;

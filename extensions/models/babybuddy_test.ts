@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
 import { z } from "npm:zod@4";
 import {
+  ageBandOf,
   aggregateByDate,
   backdatePatch,
   buildDailySummary,
@@ -187,6 +188,7 @@ const emptyEntries = {
   medication: [],
   weight: [],
   truncated: false,
+  ageBand: null,
 };
 
 Deno.test("buildDailySummary handles an empty window", () => {
@@ -264,4 +266,23 @@ Deno.test("inferTimerKind maps names to activities", () => {
   assertEquals(inferTimerKind("Timer 1"), null);
   assertEquals(inferTimerKind(null), null);
   assertEquals(inferTimerKind(42), null);
+});
+
+Deno.test("ageBandOf buckets whole-month age into coarse bands", () => {
+  const b = "2026-01-01";
+  assertEquals(ageBandOf(b, "2026-01-15T12:00:00Z"), "<4mo"); // 0 mo
+  assertEquals(ageBandOf(b, "2026-05-01T12:00:00Z"), "4-5mo"); // 4 mo
+  assertEquals(ageBandOf(b, "2026-07-15T12:00:00Z"), "6-7mo"); // 6 mo
+  assertEquals(ageBandOf(b, "2026-09-10T12:00:00Z"), "8-10mo"); // 8 mo
+  assertEquals(ageBandOf(b, "2027-01-01T12:00:00Z"), "11-13mo"); // 12 mo
+  assertEquals(ageBandOf(b, "2028-01-01T12:00:00Z"), "18-24mo"); // 24 mo
+  assertEquals(ageBandOf(b, "2028-02-01T12:00:00Z"), "24mo+"); // 25 mo
+});
+
+Deno.test("ageBandOf honors the day-of-month and rejects bad/future dates", () => {
+  // Not yet to the monthly anniversary ⇒ counts as the previous whole month.
+  assertEquals(ageBandOf("2026-01-20", "2026-05-10T12:00:00Z"), "<4mo"); // 3 mo
+  assertEquals(ageBandOf("2026-01-20", "2026-05-25T12:00:00Z"), "4-5mo"); // 4 mo
+  assertEquals(ageBandOf("2030-01-01", "2026-05-01T12:00:00Z"), null); // future
+  assertEquals(ageBandOf("not-a-date", "2026-05-01T12:00:00Z"), null);
 });

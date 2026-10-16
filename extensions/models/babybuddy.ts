@@ -47,6 +47,11 @@ const EntriesSchema = z.object({
   // Tolerant default: an "entries" snapshot persisted before this field existed
   // still parses (reports read entries.truncated). sync always sets it explicitly.
   truncated: z.boolean().default(false),
+  // Anonymized age band (e.g. "8-10mo") or null when age wasn't requested. We
+  // persist ONLY the coarse band, never the child's exact birth_date — the age
+  // interval is all any report needs. Tolerant default so pre-existing snapshots
+  // (and anonymous syncs) parse as age-agnostic.
+  ageBand: z.string().nullable().default(null),
 });
 
 const LoggedSchema = z.object({
@@ -285,6 +290,68 @@ async function resolveChild(args: GlobalArgs): Promise<number> {
   return results[0].id as number;
 }
 
+/**
+ * Coarse age bands, aligned to the developmentally meaningful regression
+ * windows (~4mo, ~8-10mo, ~12mo, ~18mo). Deliberately wide so the stored value
+ * reveals age only to within a few months — never the exact birth date. `hi` is
+ * the last whole-month age (inclusive) in the band; the final band is open.
+ */
+const AGE_BANDS: ReadonlyArray<{ hi: number | null; label: string }> = [
+  { hi: 3, label: "<4mo" },
+  { hi: 5, label: "4-5mo" },
+  { hi: 7, label: "6-7mo" },
+  { hi: 10, label: "8-10mo" },
+  { hi: 13, label: "11-13mo" },
+  { hi: 17, label: "14-17mo" },
+  { hi: 24, label: "18-24mo" },
+  { hi: null, label: "24mo+" },
+];
+
+/**
+ * Map a birth date to an anonymized age band as of `asOfIso`. Returns null for
+ * an unparseable or future birth date. Only the band label is ever surfaced —
+ * the exact date is used here and discarded, so the persisted snapshot carries
+ * age to within a band (a few months) and no finer.
+ */
+export function ageBandOf(
+  birthDateIso: string,
+  asOfIso: string,
+): string | null {
+  const birth = new Date(`${String(birthDateIso).slice(0, 10)}T00:00:00Z`);
+  const asOf = new Date(asOfIso);
+  if (Number.isNaN(birth.getTime()) || Number.isNaN(asOf.getTime())) {
+    return null;
+  }
+  let months = (asOf.getUTCFullYear() - birth.getUTCFullYear()) * 12 +
+    (asOf.getUTCMonth() - birth.getUTCMonth());
+  if (asOf.getUTCDate() < birth.getUTCDate()) months -= 1;
+  if (months < 0) return null;
+  for (const b of AGE_BANDS) {
+    if (b.hi === null || months <= b.hi) return b.label;
+  }
+  return null;
+}
+
+/**
+ * Resolve the anonymized age band for a child, or null. Reads birth_date,
+ * coarsens it, and returns only the band — the exact date never leaves this
+ * function. Any failure (unreachable, missing date) degrades to null rather than
+ * failing the sync; age is advisory.
+ */
+async function resolveAgeBand(
+  args: GlobalArgs,
+  child: number,
+  asOfIso: string,
+): Promise<string | null> {
+  try {
+    const obj = await bbRequest(args, "GET", `children/${child}/`);
+    const bd = typeof obj.birth_date === "string" ? obj.birth_date : null;
+    return bd ? ageBandOf(bd, asOfIso) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch the target timer by id, by name, or the most recently started one. */
 async function resolveTimer(
   args: GlobalArgs,
@@ -426,6 +493,11 @@ export interface EntriesSnapshot {
   weight: Array<Record<string, unknown>>;
   /** True if any endpoint returned more records than the page cap. */
   truncated: boolean;
+  /**
+   * Anonymized age band (e.g. "8-10mo"), or null when age wasn't requested.
+   * Only the coarse band is ever stored — never the exact birth_date.
+   */
+  ageBand: string | null;
 }
 
 /** Parse and validate a `sync` snapshot from raw JSON bytes. */
@@ -710,6 +782,11 @@ const SyncArgs = z.object({
   sinceHours: z.number().default(168).describe(
     "How many hours of history to pull (default 168 = 7 days)",
   ),
+  includeAge: z.boolean().default(false).describe(
+    'Opt in to an anonymized age band (e.g. "8-10mo"). When true, sync reads ' +
+      "the child's birth_date, immediately coarsens it to a band, stores ONLY " +
+      "the band, and discards the exact date. Default false = no age at all.",
+  ),
 });
 
 const DeleteEntryArgs = z.object({
@@ -777,7 +854,7 @@ const StopTimerArgs = z.object({
 /** Consolidated Baby Buddy tracker model type. */
 export const model = {
   type: "@kneel/babybuddy",
-  version: "2026.10.03.2",
+  version: "2026.10.16.1",
   globalArguments: GlobalArgsSchema,
   // Full type-version lineage. globalArguments (baseUrl/token/childId) has been
   // stable across every version, so each migration is an identity on attributes;
@@ -817,6 +894,12 @@ export const model = {
       toVersion: "2026.10.03.2",
       description:
         "Docs-only: CHANGELOG + backfilled upgrade lineage. No functional change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.16.1",
+      description:
+        "sync gains opt-in `includeAge` → anonymized age band on the entries snapshot (DOB coarsened then discarded). Sleep-regression-watch detection retune (total-wakes axis, single-axis stretch-collapse, baseline onset-guard, SEM wake corroboration) — LLM-assisted heuristics, not medically reviewed. Snapshot `ageBand` is tolerant-defaulted; model attributes unchanged.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -981,8 +1064,13 @@ export const model = {
           medication,
           weight,
         ];
+        const fetchedAt = nowIso();
+        // Opt-in only; derives a band then discards the exact birth date.
+        const ageBand = args.includeAge
+          ? await resolveAgeBand(g, child, fetchedAt)
+          : null;
         const handle = await context.writeResource("entries", "entries", {
-          fetchedAt: nowIso(),
+          fetchedAt,
           sinceHours: args.sinceHours,
           child,
           feedings: feedings.results,
@@ -995,6 +1083,7 @@ export const model = {
           medication: medication.results,
           weight: weight.results,
           truncated: lists.some((l) => l.truncated),
+          ageBand,
         });
         context.logger.info(
           "Synced {feedings} feedings, {changes} diapers, {sleep} sleep, {pumping} pumping (truncated={truncated})",
